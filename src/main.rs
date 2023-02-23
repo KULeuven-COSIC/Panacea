@@ -1,5 +1,5 @@
 use clap::Parser;
-use heoram::{
+use panacea::{
     cli::Cli,
     naive_hash::NaiveHash,
     oram::setup_random_oram,

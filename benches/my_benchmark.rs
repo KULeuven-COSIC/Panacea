@@ -5,7 +5,7 @@ use concrete_core::{
     prelude::MonomialDegree,
 };
 use criterion::{criterion_group, criterion_main, Criterion};
-use heoram::{
+use panacea::{
     context::{Context, FftBuffer},
     num_types::{One, Scalar, Zero},
     params::TFHEParameters,
