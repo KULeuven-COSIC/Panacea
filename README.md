@@ -13,8 +13,10 @@ Please do not use in production systems.
 ## Building and testing
 
 Our implementation is written in the Rust programming language.
-Please refer to [The Rust Programming Language Website](https://www.rust-lang.org/tools/install) to install the required tools (`rustup`, `cargo`, `rustc`...).
-The main library we use is [concrete-core](https://github.com/zama-ai/concrete-core), but this is imported automatically with `cargo`.
+Please refer to [The Rust Programming Language Website](https://www.rust-lang.org/tools/install)
+to install the required tools (e.g., `rustup`, `cargo` and `rustc`).
+The main library we use is [concrete-core](https://github.com/zama-ai/concrete-core),
+but this is imported automatically with `cargo`.
 
 The stable toolchain can be used for Linux and Mac computers with Intel processors.
 
@@ -30,7 +32,8 @@ cargo build --release
 cargo test --release
 ```
 ### Special Instructions Mac computers with ARM Chips
-To build natively on Mac computers with ARM chips(M1, M2...), the Rust nightly toolchain (1.68 or above) must be used.
+To build natively on Mac computers with ARM chips (e.g., M1 and M2),
+the Rust nightly toolchain (1.68 or above) must be used.
 This can be installed by running
 ```
 rustup toolchain install nightly
@@ -66,7 +69,7 @@ cargo run --release -- --help
 ./target/release/panacea --help
 ```
 
-### Running with parameters from the paper
+### Running
 
 ```
 cargo run --release -- --params params.json
@@ -74,8 +77,12 @@ cargo run --release -- --params params.json
 ./target/release/panacea --params params.json
 ```
 
+Some parameters used in the paper are given in `params.json`.
+The executable run the ORAM protocol,
+acting both as the client and the server.
+
 Note that larger parameters have higher memory requirement
-(batched mode with rows=384 and cols=4096 needs 1 TB of memory).
+(batched mode with `rows=384` and `cols=4096` needs 1 TB of memory).
 Please refer to the paper to for the exact memory requirements.
 
 ### Setting the number of threads
