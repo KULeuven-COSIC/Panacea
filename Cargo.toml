@@ -2,10 +2,12 @@
 name = "panacea"
 version = "0.2.0"
 edition = "2021"
-authors = ["Kelong Cong <kelong.cong@esat.kuleuven.be>", "Georgio Nicolas <georgio.nicolas@esat.kuleuven.be>"]
 rust-version = "1.68.0"
-readme = "README.md"
 repository = "https://github.com/KULeuven-COSIC/Panacea"
+license = "MIT"
+license-file = "LICENSE"
+readme = "README.md"
+authors = ["Kelong Cong <kelong.cong@esat.kuleuven.be>", "Georgio Nicolas <georgio.nicolas@esat.kuleuven.be>"]
 
 [profile.release]
 lto = "fat"
