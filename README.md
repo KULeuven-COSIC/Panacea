@@ -78,7 +78,7 @@ cargo run --release -- --params params.json
 ```
 
 Some parameters used in the paper are given in `params.json`.
-The executable run the ORAM protocol,
+The executable runs the ORAM protocol,
 acting both as the client and the server.
 
 Note that larger parameters have higher memory requirement
