@@ -25,7 +25,7 @@ Compiling for Windows is not supported at the moment.
 cargo build --release
 ```
 
-### To Run Tests:
+### To Run Tests
 ```
 cargo test --release
 ```
