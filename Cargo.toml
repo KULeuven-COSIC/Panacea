@@ -5,7 +5,6 @@ edition = "2021"
 rust-version = "1.68.0"
 repository = "https://github.com/KULeuven-COSIC/Panacea"
 license = "MIT"
-license-file = "LICENSE"
 readme = "README.md"
 authors = ["Kelong Cong <kelong.cong@esat.kuleuven.be>", "Georgio Nicolas <georgio.nicolas@esat.kuleuven.be>"]
 
