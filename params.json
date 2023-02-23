@@ -1,0 +1,68 @@
+[
+  [
+    [
+      {
+        "SingleQuery": {
+          "item_count": 4096,
+          "iterations": 1
+        }
+      },
+      {
+        "MultiQuery": {
+          "item_count": 4096,
+          "query_count": 36,
+          "iterations": 1
+        }
+      },
+      {
+        "Batched": {
+          "rows": 384,
+          "cols": 32,
+          "iterations": 1
+        }
+      },
+      {
+        "Batched": {
+          "rows": 384,
+          "cols": 128,
+          "iterations": 1
+        }
+      },
+      {
+        "Batched": {
+          "rows": 384,
+          "cols": 512,
+          "iterations": 1
+        }
+      },
+      {
+        "Batched": {
+          "rows": 384,
+          "cols": 2048,
+          "iterations": 1
+        }
+      },
+      {
+        "Batched": {
+          "rows": 384,
+          "cols": 4096,
+          "iterations": 1
+        }
+      }
+    ],
+    [
+      {
+        "standard_deviation": -55.0,
+        "polynomial_size": 2048,
+        "base_log": 5,
+        "level_count": 9,
+        "key_switch_base_log": 5,
+        "key_switch_level_count": 11,
+        "negs_base_log": 5,
+        "negs_level_count": 11,
+        "plaintext_modulus": 256,
+        "secure_seed": true
+      }
+    ]
+  ]
+]
