@@ -1,6 +1,6 @@
 # Panacea: Non-interactive and Stateless Oblivious RAM
 
-This is an implementation of Panacea.
+This is an implementation of [Panacea](https://eprint.iacr.org/2023/274).
 The source code is based on 
 [SortingHat](https://github.com/KULeuven-COSIC/SortingHat).
 
