@@ -33,10 +33,7 @@ impl FftBufferPool {
     }
 }
 
-struct EncOP {
-    cb0: RGSWCiphertext,
-    cb1: RGSWCiphertext,
-}
+struct EncOP(RGSWCiphertext);
 
 enum OP {
     READ,
@@ -54,7 +51,7 @@ impl ClientQuery {
     /// Turn the `op` field into a single RGSW ciphertext that indicates if
     /// the operation is a read (0) or a write (1).
     fn into_rw_flag(self) -> RGSWCiphertext {
-        self.op.cb0
+        self.op.0
     }
 }
 
@@ -144,24 +141,15 @@ impl Client {
     }
 
     fn gen_enc_op(&mut self, op: &OP) -> EncOP {
-        let mut enc_0: RGSWCiphertext =
+        let mut enc: RGSWCiphertext =
             RGSWCiphertext::allocate(self.ctx.poly_size, self.ctx.base_log, self.ctx.level_count);
-        let mut enc_1: RGSWCiphertext =
-            RGSWCiphertext::allocate(self.ctx.poly_size, self.ctx.base_log, self.ctx.level_count);
-        self.sk
-            .encrypt_constant_rgsw(&mut enc_0, &Plaintext(Scalar::zero()), &mut self.ctx);
-        self.sk
-            .encrypt_constant_rgsw(&mut enc_1, &Plaintext(Scalar::one()), &mut self.ctx);
-        match op {
-            OP::READ => EncOP {
-                cb0: enc_0,
-                cb1: enc_1,
-            },
-            OP::WRITE => EncOP {
-                cb0: enc_1,
-                cb1: enc_0,
-            },
-        }
+        let pt = match op {
+            OP::READ => Plaintext(Scalar::zero()),
+            OP::WRITE => Plaintext(Scalar::one()),
+        };
+
+        self.sk.encrypt_constant_rgsw(&mut enc, &pt, &mut self.ctx);
+        EncOP(enc)
     }
 
     fn enc_data_rlwe(&mut self, alpha: &PlaintextList<Vec<Scalar>>) -> RLWECiphertext {
@@ -248,10 +236,7 @@ fn rw(
     buf: &mut FftBuffer,
 ) -> RLWECiphertext {
     let mut c0 = RLWECiphertext::allocate(ctx.poly_size);
-    let mut c1 = RLWECiphertext::allocate(ctx.poly_size);
-    op.cb0.external_product_with_buf(&mut c0, a, buf);
-    op.cb1.external_product_with_buf(&mut c1, b, buf);
-    c0.update_with_add(&c1);
+    op.0.cmux_with_buf(&mut c0, b, a, buf);
     c0
 }
 
