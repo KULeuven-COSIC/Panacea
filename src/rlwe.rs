@@ -1007,6 +1007,7 @@ pub fn expand_fourier(
     neg_s: &RGSWCiphertext,
     ctx: &Context,
 ) -> RGSWCiphertext {
+    // TODO take the fourier buffer as an argument
     let mut buf = FftBuffer::new(cs[0].polynomial_size());
     let mut out = RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count);
     let mut c_prime = RLWECiphertext::allocate(ctx.poly_size);

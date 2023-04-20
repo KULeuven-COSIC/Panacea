@@ -1,3 +1,4 @@
+use crate::rlwe::FourierRLWEKeyswitchKey;
 use crate::{
     context::{Context, FftBuffer},
     decision_tree::{bit_decomposed_rgsw, demux_with},
@@ -14,6 +15,7 @@ use concrete_core::commons::{
     math::tensor::AsMutTensor,
 };
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::{
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
@@ -40,9 +42,28 @@ enum OP {
     WRITE,
 }
 
+enum QueryIndex {
+    /// An unpacked query is one that encrypts each bit of the
+    /// query index bit-decomposition in an RGSW ciphertext.
+    Unpacked(Vec<RGSWCiphertext>),
+    /// A packed query is one that encrypts each bit of the
+    /// query index bit-decomposition in \ell RLWE ciphertexts.
+    /// The expansion is performed using `expand_fourier`.
+    Packed,
+}
+
+impl QueryIndex {
+    fn len(&self) -> usize {
+        match self {
+            QueryIndex::Unpacked(a) => a.len(),
+            QueryIndex::Packed => unimplemented!(),
+        }
+    }
+}
+
 /// The client's encrypted query.
 pub struct ClientQuery {
-    a: Vec<RGSWCiphertext>,
+    a: QueryIndex,
     op: EncOP,
     data: RLWECiphertext,
 }
@@ -164,7 +185,7 @@ impl Client {
         let dummy_data = self.ctx.gen_binary_pt();
 
         ClientQuery {
-            a,
+            a: QueryIndex::Unpacked(a),
             op: self.gen_enc_op(&OP::READ),
             data: self.enc_data_rlwe(&dummy_data),
         }
@@ -194,7 +215,7 @@ impl Client {
         // let item_count = self.rows * self.cols / hash.h_count();
         let a = bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx);
         ClientQuery {
-            a,
+            a: QueryIndex::Unpacked(a),
             op: self.gen_enc_op(&OP::WRITE),
             data: self.enc_data_rlwe(alpha),
         }
@@ -254,7 +275,12 @@ fn process_one_mt(
         let shift: usize = (Scalar::BITS as usize) - ctx.base_log.0 * level;
         *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one() << shift;
 
-        let tmp = demux_with(c, &query.a, ctx, &mut buf.pool[tid].clone().lock().unwrap());
+        let tmp = match &query.a {
+            QueryIndex::Unpacked(a) => {
+                demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
+            }
+            QueryIndex::Packed => unimplemented!(),
+        };
         assert_eq!(tmp.len(), 1 << query.a.len());
         tmp
     };
@@ -354,7 +380,12 @@ fn process_one_st(
         let shift: usize = (Scalar::BITS as usize) - ctx.base_log.0 * level;
         *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one() << shift;
 
-        let tmp = demux_with(c, &query.a, ctx, &mut buf.pool[tid].clone().lock().unwrap());
+        let tmp = match &query.a {
+            QueryIndex::Unpacked(a) => {
+                demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
+            }
+            QueryIndex::Packed => unimplemented!(),
+        };
         assert_eq!(tmp.len(), 1 << query.a.len());
         demux_res.push(tmp);
     }
@@ -417,6 +448,7 @@ fn update_db_st(
 pub struct Server {
     data: Vec<Arc<RwLock<Vec<RLWECiphertext>>>>,
     neg_s: RGSWCiphertext,
+    ksk_map: Option<HashMap<usize, FourierRLWEKeyswitchKey>>,
     ctx: Context,
 }
 
@@ -433,6 +465,7 @@ impl Server {
                 .map(|row| Arc::new(RwLock::new(row)))
                 .collect(),
             neg_s,
+            ksk_map: None,
             ctx: Context::new(params),
         }
     }
