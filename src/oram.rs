@@ -1,5 +1,5 @@
 use crate::lwe::LWEtoRLWEKeyswitchKey;
-use crate::rlwe::{make_decomposed_rlwe_ct2, FourierRLWEKeyswitchKey};
+use crate::rlwe::{expand_slow, make_decomposed_rlwe_ct2, FourierRLWEKeyswitchKey};
 use crate::{
     context::{Context, FftBuffer},
     decision_tree::{bit_decomposed_rgsw, demux_with},
@@ -298,6 +298,7 @@ fn process_one_mt(
     query: &ClientQuery,
     data: Arc<RwLock<Vec<RLWECiphertext>>>,
     neg_s: &RGSWCiphertext,
+    ksks: &LWEtoRLWEKeyswitchKey,
     buf: &FftBufferPool,
     ctx: &Context,
 ) -> (RLWECiphertext, Vec<RGSWCiphertext>) {
@@ -311,7 +312,14 @@ fn process_one_mt(
             QueryIndex::Unpacked(a) => {
                 demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
             }
-            QueryIndex::Packed(a) => unimplemented!(),
+            QueryIndex::Packed(a) => demux_with(
+                c,
+                &a.into_iter()
+                    .map(|r| expand_slow(r, ksks, neg_s, ctx))
+                    .collect(),
+                ctx,
+                &mut buf.pool[tid].clone().lock().unwrap(),
+            ),
         };
         assert_eq!(tmp.len(), 1 << query.a.len());
         tmp
@@ -402,6 +410,7 @@ fn process_one_st(
     query: &ClientQuery,
     data: Arc<RwLock<Vec<RLWECiphertext>>>,
     neg_s: &RGSWCiphertext,
+    ksks: &LWEtoRLWEKeyswitchKey,
     buf: &FftBufferPool,
     ctx: &Context,
 ) -> (RLWECiphertext, Vec<RGSWCiphertext>) {
@@ -416,7 +425,14 @@ fn process_one_st(
             QueryIndex::Unpacked(a) => {
                 demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
             }
-            QueryIndex::Packed(a) => unimplemented!(),
+            QueryIndex::Packed(a) => demux_with(
+                c,
+                &a.into_iter()
+                    .map(|r| expand_slow(r, ksks, neg_s, ctx))
+                    .collect(),
+                ctx,
+                &mut buf.pool[tid].clone().lock().unwrap(),
+            ),
         };
         assert_eq!(tmp.len(), 1 << query.a.len());
         demux_res.push(tmp);
@@ -517,7 +533,14 @@ impl Server {
     pub fn process_one(&mut self, query: ClientQuery) -> (RLWECiphertext, Duration) {
         let buf = FftBufferPool::new(rayon::max_num_threads(), &self.ctx);
         let start = Instant::now();
-        let (y, ls) = process_one_mt(&query, self.data[0].clone(), &self.neg_s, &buf, &self.ctx);
+        let (y, ls) = process_one_mt(
+            &query,
+            self.data[0].clone(),
+            &self.neg_s,
+            &self.ksks,
+            &buf,
+            &self.ctx,
+        );
         let dur = start.elapsed();
         update_db_mt(&query, self.data[0].clone(), ls, &buf, &self.ctx);
         (y, dur)
@@ -532,7 +555,16 @@ impl Server {
         let start = Instant::now();
         let (ys, ls): (Vec<RLWECiphertext>, Vec<Vec<RGSWCiphertext>>) = queries
             .par_iter()
-            .map(|query| process_one_st(query, self.data[0].clone(), &self.neg_s, &buf, &self.ctx))
+            .map(|query| {
+                process_one_st(
+                    query,
+                    self.data[0].clone(),
+                    &self.neg_s,
+                    &self.ksks,
+                    &buf,
+                    &self.ctx,
+                )
+            })
             .unzip();
         let dur = start.elapsed();
 
@@ -620,7 +652,14 @@ impl Server {
             .par_iter()
             .zip(0..self.rows())
             .map(|(query, row)| {
-                process_one_st(query, self.data[row].clone(), &self.neg_s, &buf, &self.ctx)
+                process_one_st(
+                    query,
+                    self.data[row].clone(),
+                    &self.neg_s,
+                    &self.ksks,
+                    &buf,
+                    &self.ctx,
+                )
             })
             .unzip();
         let dur = start.elapsed();
@@ -944,6 +983,71 @@ mod test {
             server.process_batch(write_query, &hash);
 
             let read_query = client.gen_read_query_batch(&indices, &hash, false);
+            let ys = server.process_batch(read_query, &hash).0;
+            let mut pt = client.ctx.gen_zero_pt();
+            for (r, _) in mapping {
+                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                assert_eq!(new_data, pt);
+            }
+
+            // additionally check the database is consistent
+            for i in indices {
+                for h in 0..h_count {
+                    let (r, c) = hash.hash_to_tuple(h, i, cols);
+                    client.sk.decrypt_decode_rlwe(
+                        &mut pt,
+                        &server.data[r].clone().read().unwrap()[c],
+                        &client.ctx,
+                    );
+                    assert_eq!(new_data, pt);
+                }
+            }
+        }
+    }
+    #[test]
+    fn test_oram_batch_pack() {
+        let n = 16usize;
+        let h_count = 4usize;
+        let rows = 8usize;
+        let cols = h_count * n / rows;
+        let hash = NaiveHash::new(h_count, n);
+        let (mut client, mut server, pts) =
+            setup_random_oram(rows, cols, &hash, TFHEParameters::default());
+        assert_eq!(n, pts.len());
+
+        {
+            // read
+            let indices = vec![0usize, 1usize];
+            let mapping = hash.hash_to_mapping(&indices, cols);
+            let query = client.gen_read_query_batch(&indices, &hash, true);
+            let ys = server.process_batch(query, &hash).0;
+
+            let mut pt = client.ctx.gen_zero_pt();
+            let mut noise_checked = true;
+            for (r, (_, i)) in mapping {
+                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                assert_eq!(pts[indices[i]], pt);
+
+                // check noise
+                if !noise_checked {
+                    println!(
+                        "noise for read: {}",
+                        compute_noise_encoded(&client.sk, &ys[r], &pt, &client.ctx.codec)
+                    );
+                    noise_checked = true;
+                }
+            }
+        }
+
+        {
+            // write
+            let indices = vec![1usize, 2usize];
+            let mapping = hash.hash_to_mapping(&indices, cols);
+            let new_data = client.ctx.gen_binary_pt();
+            let write_query = client.gen_write_query_batch(&indices, &new_data, &hash, true);
+            server.process_batch(write_query, &hash);
+
+            let read_query = client.gen_read_query_batch(&indices, &hash, true);
             let ys = server.process_batch(read_query, &hash).0;
             let mut pt = client.ctx.gen_zero_pt();
             for (r, _) in mapping {
