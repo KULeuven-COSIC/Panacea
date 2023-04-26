@@ -209,11 +209,11 @@ impl Client {
 
     fn make_read_query(&mut self, i: usize, pack: bool) -> ClientQuery {
         // let item_count = self.rows * self.cols / hash.h_count();
-
+        let a = self.gen_query_index(i, pack);
         let dummy_data = self.ctx.gen_binary_pt();
 
         ClientQuery {
-            a: self.gen_query_index(i, pack),
+            a,
             op: self.gen_enc_op(&OP::READ),
             data: self.enc_data_rlwe(&dummy_data),
         }
@@ -240,11 +240,17 @@ impl Client {
             .collect()
     }
 
-    fn make_write_query(&mut self, i: usize, alpha: &PlaintextList<Vec<Scalar>>) -> ClientQuery {
+    fn make_write_query(
+        &mut self,
+        i: usize,
+        alpha: &PlaintextList<Vec<Scalar>>,
+        pack: bool,
+    ) -> ClientQuery {
         // let item_count = self.rows * self.cols / hash.h_count();
-        let a = bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx);
+        let a = self.gen_query_index(i, pack);
+
         ClientQuery {
-            a: QueryIndex::Unpacked(a),
+            a,
             op: self.gen_enc_op(&OP::WRITE),
             data: self.enc_data_rlwe(alpha),
         }
@@ -274,7 +280,7 @@ impl Client {
         let mapping = hash.hash_to_mapping(indices, self.cols);
         (0..self.rows)
             .map(|r| match mapping.get(&r) {
-                Some(c) => self.make_write_query(c.0, alpha),
+                Some(c) => self.make_write_query(c.0, alpha, pack),
                 None => self.make_read_query(0, pack),
             })
             .collect()
