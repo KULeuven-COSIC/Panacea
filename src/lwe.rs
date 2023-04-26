@@ -143,7 +143,7 @@ impl LWEtoRLWEKeyswitchKey {
     pub fn allocate(ctx: &Context) -> Self {
         Self {
             inner: vec![
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count);
+                RGSWCiphertext::allocate(ctx.poly_size, ctx.ks_base_log, ctx.ks_level_count);
                 ctx.poly_size.0
             ],
         }
@@ -152,13 +152,12 @@ impl LWEtoRLWEKeyswitchKey {
     pub fn fill_with_keyswitching_key(&mut self, sk: &LWESecretKey, ctx: &mut Context) {
         assert_eq!(ctx.poly_size.0, sk.key_size().0);
         let rlwe_sk = sk.to_rlwe_sk();
-        self.inner = vec![];
-        for s in sk.0.as_tensor().iter() {
+
+        assert_eq!(ctx.poly_size.0, sk.0.as_tensor().len());
+        // self.inner = vec![];
+        for (i, s) in sk.0.as_tensor().iter().enumerate() {
             // TODO what is the decomposition parameters?
-            let mut rgsw_ct =
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.ks_base_log, ctx.ks_level_count);
-            rlwe_sk.encrypt_constant_rgsw(&mut rgsw_ct, &Plaintext(*s), ctx);
-            self.inner.push(rgsw_ct);
+            rlwe_sk.encrypt_constant_rgsw(&mut self.inner[i], &Plaintext(*s), ctx);
         }
     }
 }

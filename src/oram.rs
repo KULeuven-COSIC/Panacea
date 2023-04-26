@@ -1,5 +1,6 @@
 use crate::lwe::LWEtoRLWEKeyswitchKey;
-use crate::rlwe::{expand_slow, make_decomposed_rlwe_ct2, FourierRLWEKeyswitchKey};
+use crate::rlwe::{expand_slow, make_decomposed_rlwe_ct2};
+use crate::utils::log2;
 use crate::{
     context::{Context, FftBuffer},
     decision_tree::{bit_decomposed_rgsw, demux_with},
@@ -18,7 +19,6 @@ use concrete_core::commons::{
 };
 use rayon::prelude::*;
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -58,7 +58,7 @@ impl QueryIndex {
     fn len(&self) -> usize {
         match self {
             QueryIndex::Unpacked(a) => a.len(),
-            QueryIndex::Packed(a) => a.len() * a[0].len(),
+            QueryIndex::Packed(a) => a.len(),
         }
     }
 }
@@ -193,17 +193,19 @@ impl Client {
             false => {
                 QueryIndex::Unpacked(bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx))
             }
-            true => QueryIndex::Packed(i.view_bits::<Lsb0>().to_bitvec().into_iter().fold(
-                vec![],
-                |mut acc, b| {
-                    acc.push(make_decomposed_rlwe_ct2(
-                        &self.sk,
-                        b as Scalar,
-                        &mut self.ctx,
-                    ));
-                    acc
-                },
-            )),
+            true => QueryIndex::Packed(
+                i.view_bits::<Lsb0>()[..log2(self.cols)]
+                    .to_bitvec()
+                    .into_iter()
+                    .fold(vec![], |mut acc, b| {
+                        acc.push(make_decomposed_rlwe_ct2(
+                            &self.sk,
+                            b as Scalar,
+                            &mut self.ctx,
+                        ));
+                        acc
+                    }),
+            ),
         }
     }
 
@@ -502,7 +504,6 @@ fn update_db_st(
 pub struct Server {
     data: Vec<Arc<RwLock<Vec<RLWECiphertext>>>>,
     neg_s: RGSWCiphertext,
-    ksk_map: Option<HashMap<usize, FourierRLWEKeyswitchKey>>,
     ksks: LWEtoRLWEKeyswitchKey,
     ctx: Context,
 }
@@ -521,7 +522,6 @@ impl Server {
                 .map(|row| Arc::new(RwLock::new(row)))
                 .collect(),
             neg_s,
-            ksk_map: None,
             ksks: ksks,
             ctx: Context::new(params),
         }
@@ -846,7 +846,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_oram_more() {
         let n = 2048usize;
         let hash = NaiveHash::new(1, n);
@@ -1017,8 +1016,15 @@ mod test {
         let rows = 8usize;
         let cols = h_count * n / rows;
         let hash = NaiveHash::new(h_count, n);
-        let (mut client, mut server, pts) =
-            setup_random_oram(rows, cols, &hash, TFHEParameters::default());
+        let (mut client, mut server, pts) = setup_random_oram(
+            rows,
+            cols,
+            &hash,
+            TFHEParameters {
+                // polynomial_size: 8,
+                ..TFHEParameters::default()
+            },
+        );
         assert_eq!(n, pts.len());
 
         {
@@ -1077,7 +1083,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_oram_batch_more() {
         let h_count = 3usize;
         let rows = 3;
