@@ -1,4 +1,5 @@
-use crate::rlwe::FourierRLWEKeyswitchKey;
+use crate::lwe::LWEtoRLWEKeyswitchKey;
+use crate::rlwe::{make_decomposed_rlwe_ct2, FourierRLWEKeyswitchKey};
 use crate::{
     context::{Context, FftBuffer},
     decision_tree::{bit_decomposed_rgsw, demux_with},
@@ -10,13 +11,14 @@ use crate::{
     utils::pt_to_lossy_u64,
     utils::transpose,
 };
+use bitvec::{order::Lsb0, view::BitView};
 use concrete_core::commons::{
     crypto::encoding::{Plaintext, PlaintextList},
     math::tensor::AsMutTensor,
 };
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
@@ -49,14 +51,14 @@ enum QueryIndex {
     /// A packed query is one that encrypts each bit of the
     /// query index bit-decomposition in \ell RLWE ciphertexts.
     /// The expansion is performed using `expand_fourier`.
-    Packed,
+    Packed(Vec<Vec<RLWECiphertext>>),
 }
 
 impl QueryIndex {
     fn len(&self) -> usize {
         match self {
             QueryIndex::Unpacked(a) => a.len(),
-            QueryIndex::Packed => unimplemented!(),
+            QueryIndex::Packed(a) => a.len() * a[0].len(),
         }
     }
 }
@@ -79,6 +81,7 @@ impl ClientQuery {
 /// ORAM client state.
 pub struct Client {
     pub sk: RLWESecretKey,
+    pub ksks: LWEtoRLWEKeyswitchKey,
     pub ctx: Context,
     pub rows: usize,
     pub cols: usize,
@@ -90,9 +93,15 @@ impl Client {
     /// number of hash functions.
     pub fn new(rows: usize, cols: usize, params: TFHEParameters) -> Self {
         let mut ctx = Context::new(params);
-        let sk = ctx.gen_rlwe_sk();
+        let sk_lwe = ctx.gen_lwe_sk();
+        let sk = sk_lwe.to_rlwe_sk();
+
+        let mut ksks = LWEtoRLWEKeyswitchKey::allocate(&ctx);
+        ksks.fill_with_keyswitching_key(&sk_lwe, &mut ctx);
+
         Self {
             sk,
+            ksks,
             ctx,
             rows,
             cols,
@@ -179,21 +188,40 @@ impl Client {
         out
     }
 
-    fn make_read_query(&mut self, i: usize) -> ClientQuery {
+    fn gen_query_index(&mut self, i: usize, pack: bool) -> QueryIndex {
+        match pack {
+            false => {
+                QueryIndex::Unpacked(bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx))
+            }
+            true => QueryIndex::Packed(i.view_bits::<Lsb0>().to_bitvec().into_iter().fold(
+                vec![],
+                |mut acc, b| {
+                    acc.push(make_decomposed_rlwe_ct2(
+                        &self.sk,
+                        b as Scalar,
+                        &mut self.ctx,
+                    ));
+                    acc
+                },
+            )),
+        }
+    }
+
+    fn make_read_query(&mut self, i: usize, pack: bool) -> ClientQuery {
         // let item_count = self.rows * self.cols / hash.h_count();
-        let a = bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx);
+
         let dummy_data = self.ctx.gen_binary_pt();
 
         ClientQuery {
-            a: QueryIndex::Unpacked(a),
+            a: self.gen_query_index(i, pack),
             op: self.gen_enc_op(&OP::READ),
             data: self.enc_data_rlwe(&dummy_data),
         }
     }
 
     /// Generate a read query for a single element at index `i`.
-    pub fn gen_read_query_one(&mut self, i: usize, hash: &NaiveHash) -> ClientQuery {
-        self.gen_read_query_batch(&[i], hash).remove(0)
+    pub fn gen_read_query_one(&mut self, i: usize, hash: &NaiveHash, pack: bool) -> ClientQuery {
+        self.gen_read_query_batch(&[i], hash, pack).remove(0)
     }
 
     /// Generate a read query for a batch of elements.
@@ -201,12 +229,13 @@ impl Client {
         &mut self,
         indices: &[usize],
         hash: &NaiveHash,
+        pack: bool,
     ) -> Vec<ClientQuery> {
         let mapping = hash.hash_to_mapping(indices, self.cols);
         (0..self.rows)
             .map(|r| match mapping.get(&r) {
-                Some(c) => self.make_read_query(c.0),
-                None => self.make_read_query(0),
+                Some(c) => self.make_read_query(c.0, pack),
+                None => self.make_read_query(0, pack),
             })
             .collect()
     }
@@ -227,8 +256,10 @@ impl Client {
         i: usize,
         alpha: &PlaintextList<Vec<Scalar>>,
         hash: &NaiveHash,
+        pack: bool,
     ) -> ClientQuery {
-        self.gen_write_query_batch(&[i], alpha, hash).remove(0)
+        self.gen_write_query_batch(&[i], alpha, hash, pack)
+            .remove(0)
     }
 
     /// Generate a write query for a batch of elements.
@@ -237,13 +268,14 @@ impl Client {
         indices: &[usize],
         alpha: &PlaintextList<Vec<Scalar>>,
         hash: &NaiveHash,
+        pack: bool,
     ) -> Vec<ClientQuery> {
         // TODO use multiple alphas
         let mapping = hash.hash_to_mapping(indices, self.cols);
         (0..self.rows)
             .map(|r| match mapping.get(&r) {
                 Some(c) => self.make_write_query(c.0, alpha),
-                None => self.make_read_query(0),
+                None => self.make_read_query(0, pack),
             })
             .collect()
     }
@@ -279,7 +311,7 @@ fn process_one_mt(
             QueryIndex::Unpacked(a) => {
                 demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
             }
-            QueryIndex::Packed => unimplemented!(),
+            QueryIndex::Packed(a) => unimplemented!(),
         };
         assert_eq!(tmp.len(), 1 << query.a.len());
         tmp
@@ -384,7 +416,7 @@ fn process_one_st(
             QueryIndex::Unpacked(a) => {
                 demux_with(c, a, ctx, &mut buf.pool[tid].clone().lock().unwrap())
             }
-            QueryIndex::Packed => unimplemented!(),
+            QueryIndex::Packed(a) => unimplemented!(),
         };
         assert_eq!(tmp.len(), 1 << query.a.len());
         demux_res.push(tmp);
@@ -449,6 +481,7 @@ pub struct Server {
     data: Vec<Arc<RwLock<Vec<RLWECiphertext>>>>,
     neg_s: RGSWCiphertext,
     ksk_map: Option<HashMap<usize, FourierRLWEKeyswitchKey>>,
+    ksks: LWEtoRLWEKeyswitchKey,
     ctx: Context,
 }
 
@@ -457,6 +490,7 @@ impl Server {
     pub fn new(
         data: Vec<Vec<RLWECiphertext>>,
         neg_s: RGSWCiphertext,
+        ksks: LWEtoRLWEKeyswitchKey,
         params: TFHEParameters,
     ) -> Self {
         Self {
@@ -466,6 +500,7 @@ impl Server {
                 .collect(),
             neg_s,
             ksk_map: None,
+            ksks: ksks,
             ctx: Context::new(params),
         }
     }
@@ -649,7 +684,7 @@ pub fn setup_random_oram(
     let neg_sk_ct = client.gen_neg_sk();
 
     let (plain, data) = client.gen_dummy_database(hash);
-    let server = Server::new(data, neg_sk_ct, params);
+    let server = Server::new(data, neg_sk_ct, client.ksks.clone(), params);
 
     (client, server, plain)
 }
@@ -735,7 +770,7 @@ mod test {
         {
             // read
             let idx = 1usize;
-            let query = client.gen_read_query_one(idx, &hash);
+            let query = client.gen_read_query_one(idx, &hash, false);
             let y = server.process_one(query).0;
             let mut pt = client.ctx.gen_zero_pt();
             client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
@@ -753,10 +788,10 @@ mod test {
             // write
             let idx = 1usize;
             let new_data = client.ctx.gen_binary_pt();
-            let write_query = client.gen_write_query_one(idx, &new_data, &hash);
+            let write_query = client.gen_write_query_one(idx, &new_data, &hash, false);
             server.process_one(write_query);
 
-            let read_query = client.gen_read_query_one(idx, &hash);
+            let read_query = client.gen_read_query_one(idx, &hash, false);
             let y = server.process_one(read_query).0;
             let mut pt = client.ctx.gen_zero_pt();
             client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
@@ -777,7 +812,7 @@ mod test {
         for i in 0..20 {
             // read
             let idx = 1usize;
-            let query = client.gen_read_query_one(idx, &hash);
+            let query = client.gen_read_query_one(idx, &hash, false);
             let y = server.process_one(query).0;
             let mut pt = client.ctx.gen_zero_pt();
             client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
@@ -806,8 +841,8 @@ mod test {
             let idx1 = 1usize;
             let idx2 = 2usize;
             let queries = vec![
-                client.gen_read_query_one(idx1, &hash),
-                client.gen_read_query_one(idx2, &hash),
+                client.gen_read_query_one(idx1, &hash, false),
+                client.gen_read_query_one(idx2, &hash, false),
             ];
             let ys = server.process_multi(queries).0;
 
@@ -835,14 +870,14 @@ mod test {
             let idx2 = 2usize;
             let new_data = client.ctx.gen_binary_pt();
             let write_queries = vec![
-                client.gen_write_query_one(idx1, &new_data, &hash),
-                client.gen_write_query_one(idx2, &new_data, &hash),
+                client.gen_write_query_one(idx1, &new_data, &hash, false),
+                client.gen_write_query_one(idx2, &new_data, &hash, false),
             ];
             server.process_multi(write_queries);
 
             let read_queries = vec![
-                client.gen_read_query_one(idx1, &hash),
-                client.gen_read_query_one(idx2, &hash),
+                client.gen_read_query_one(idx1, &hash, false),
+                client.gen_read_query_one(idx2, &hash, false),
             ];
             let ys = server.process_multi(read_queries).0;
 
@@ -880,7 +915,7 @@ mod test {
             // read
             let indices = vec![0usize, 1usize];
             let mapping = hash.hash_to_mapping(&indices, cols);
-            let query = client.gen_read_query_batch(&indices, &hash);
+            let query = client.gen_read_query_batch(&indices, &hash, false);
             let ys = server.process_batch(query, &hash).0;
 
             let mut pt = client.ctx.gen_zero_pt();
@@ -905,10 +940,10 @@ mod test {
             let indices = vec![1usize, 2usize];
             let mapping = hash.hash_to_mapping(&indices, cols);
             let new_data = client.ctx.gen_binary_pt();
-            let write_query = client.gen_write_query_batch(&indices, &new_data, &hash);
+            let write_query = client.gen_write_query_batch(&indices, &new_data, &hash, false);
             server.process_batch(write_query, &hash);
 
-            let read_query = client.gen_read_query_batch(&indices, &hash);
+            let read_query = client.gen_read_query_batch(&indices, &hash, false);
             let ys = server.process_batch(read_query, &hash).0;
             let mut pt = client.ctx.gen_zero_pt();
             for (r, _) in mapping {
@@ -950,7 +985,7 @@ mod test {
             // read
             let indices = vec![0usize, 1usize];
             let mapping = hash.hash_to_mapping(&indices, cols);
-            let query = client.gen_read_query_batch(&indices, &hash);
+            let query = client.gen_read_query_batch(&indices, &hash, false);
 
             let server_process = Instant::now();
             let ys = server.process_batch(query, &hash).0;

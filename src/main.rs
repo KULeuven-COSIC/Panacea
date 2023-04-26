@@ -20,7 +20,7 @@ fn single_query(item_count: usize, iterations: usize, tfhe_params: TFHEParameter
 
         // preparing for a read
         let idx = 0usize;
-        let query = client.gen_read_query_one(idx, &hash);
+        let query = client.gen_read_query_one(idx, &hash, false);
         let setup_duration = setup_instant.elapsed().as_secs_f64();
 
         let server_instant = Instant::now();
@@ -40,7 +40,7 @@ fn single_query(item_count: usize, iterations: usize, tfhe_params: TFHEParameter
 
         // run the remaining iterations
         for iter in 1..iterations {
-            let query = client.gen_read_query_one(idx, &hash);
+            let query = client.gen_read_query_one(idx, &hash, false);
             let (y, _) = server.process_one(query);
             let mut pt = client.ctx.gen_zero_pt();
             client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
@@ -70,7 +70,7 @@ fn multi_query(
         assert_eq!(item_count, pts.len());
 
         let queries = (0..query_count)
-            .map(|i| client.gen_read_query_one(i + 1, &hash))
+            .map(|i| client.gen_read_query_one(i + 1, &hash, false))
             .collect();
 
         let setup_duration = setup_instant.elapsed().as_secs_f64();
@@ -94,7 +94,7 @@ fn multi_query(
         // run the remaining iterations
         for iter in 1..iterations {
             let queries = (0..query_count)
-                .map(|i| client.gen_read_query_one(i + 1, &hash))
+                .map(|i| client.gen_read_query_one(i + 1, &hash, false))
                 .collect();
             let (ys, _) = server.process_multi(queries);
 
@@ -134,7 +134,7 @@ fn batch_query(
 
         // preparing for a read
         let indices = vec![0usize, 1usize];
-        let query = client.gen_read_query_batch(&indices, &hash);
+        let query = client.gen_read_query_batch(&indices, &hash, false);
         let setup_duration = setup_instant.elapsed().as_secs_f64();
 
         let server_instant = Instant::now();
@@ -157,7 +157,7 @@ fn batch_query(
         println!("{setup_duration},{server_duration},{response_duration},{avg_noise}");
 
         for iter in 1..iterations {
-            let query = client.gen_read_query_batch(&indices, &hash);
+            let query = client.gen_read_query_batch(&indices, &hash, false);
             let (ys, _) = server.process_batch(query, &hash);
             let mapping = hash.hash_to_mapping(&indices, cols);
             let mut pt = client.ctx.gen_zero_pt();
