@@ -1,3 +1,4 @@
+use concrete_core::commons::math::tensor::{AsRefSlice, Tensor};
 use concrete_core::{
     commons::{
         crypto::{
@@ -68,6 +69,17 @@ impl LWECiphertext {
         self.0
             .fill_with_glwe_sample_extraction(&c.0, MonomialDegree(0));
     }
+
+    pub fn fill_with_tensor<C>(&mut self, t: &Tensor<C>)
+    where
+        Tensor<C>: AsRefSlice<Element = Scalar>,
+    {
+        self.0.as_mut_tensor().fill_with_copy(t);
+    }
+
+    pub fn as_tensor(&self) -> &Tensor<Vec<Scalar>> {
+        self.0.as_tensor()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +134,7 @@ impl LWESecretKey {
 
     pub fn to_rlwe_sk(&self) -> RLWESecretKey {
         let mut sk = RLWESecretKey::zero(PolynomialSize(self.0.key_size().0));
-        sk.fill_with_copy(self.0.as_tensor());
+        sk.fill_with_tensor(self.0.as_tensor());
         sk
     }
 
@@ -244,6 +256,23 @@ mod test {
             sk.decode_decrypt_lwe(&mut actual, &ct, &ctx);
             assert_eq!(expected, actual);
         }
+    }
+
+    #[test]
+    fn test_lwe_fill() {
+        let mut ctx = Context::new(TFHEParameters::default());
+        let sk = LWESecretKey::generate_binary(ctx.lwe_dim(), &mut ctx.secret_generator);
+
+        let expected = ctx.gen_scalar_binary_pt();
+        let mut ct = LWECiphertext::allocate(ctx.lwe_size());
+        sk.encode_encrypt_lwe(&mut ct, &expected, &mut ctx);
+
+        let mut ct2 = LWECiphertext::allocate(ctx.lwe_size());
+        ct2.fill_with_tensor(ct.as_tensor());
+
+        let mut actual = ctx.gen_scalar_zero_pt();
+        sk.decode_decrypt_lwe(&mut actual, &ct2, &ctx);
+        assert_eq!(expected, actual);
     }
 
     #[test]

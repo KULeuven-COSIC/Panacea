@@ -76,6 +76,13 @@ impl RLWECiphertext {
         self.0.as_mut_tensor().fill_with_copy(other.0.as_tensor());
     }
 
+    pub fn fill_with_tensor<C>(&mut self, t: &Tensor<C>)
+    where
+        Tensor<C>: AsRefSlice<Element = Scalar>,
+    {
+        self.0.as_mut_tensor().fill_with_copy(t);
+    }
+
     pub fn update_mask_with_add<C>(&mut self, other: &Polynomial<C>)
     where
         C: AsRefSlice<Element = Scalar>,
@@ -319,7 +326,7 @@ impl RLWESecretKey {
         ))
     }
 
-    pub fn fill_with_copy<C>(&mut self, t: &Tensor<C>)
+    pub fn fill_with_tensor<C>(&mut self, t: &Tensor<C>)
     where
         Tensor<C>: AsRefSlice<Element = Scalar>,
     {
@@ -549,7 +556,7 @@ impl RLWEKeyswitchKey {
     ) {
         // TODO reduce copy
         let before_poly = eval_x_k(&after_key.0.as_polynomial_list().get_polynomial(0), k);
-        before_key.fill_with_copy(before_poly.as_tensor());
+        before_key.fill_with_tensor(before_poly.as_tensor());
         self.fill_with_keyswitch_key(before_key, after_key, noise_parameters, generator);
         self.subs_k = k;
     }
