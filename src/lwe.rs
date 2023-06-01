@@ -29,7 +29,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 /// An LWE ciphertext.
-pub struct LWECiphertext(pub(crate) LweCiphertext<Vec<Scalar>>);
+pub struct LWECiphertext(pub LweCiphertext<Vec<Scalar>>);
 
 impl LWECiphertext {
     pub fn allocate(size: LweSize) -> Self {

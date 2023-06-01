@@ -38,7 +38,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 /// An RLWE ciphertext.
 /// It is a wrapper around `GlweCiphertext` from concrete.
-pub struct RLWECiphertext(pub(crate) GlweCiphertext<ScalarContainer>);
+pub struct RLWECiphertext(pub GlweCiphertext<ScalarContainer>);
 
 impl RLWECiphertext {
     pub fn allocate(poly_size: PolynomialSize) -> Self {
@@ -303,7 +303,7 @@ impl RLWECiphertext {
 
 #[derive(Debug, Clone)]
 /// An RLWE secret key.
-pub struct RLWESecretKey(pub(crate) GlweSecretKey<BinaryKeyKind, Vec<Scalar>>);
+pub struct RLWESecretKey(pub GlweSecretKey<BinaryKeyKind, Vec<Scalar>>);
 
 impl RLWESecretKey {
     /// Generate a secret key where the coefficients are binary.

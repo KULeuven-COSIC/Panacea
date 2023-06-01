@@ -21,7 +21,7 @@ use dyn_stack::{DynStack, ReborrowMut};
 #[derive(Debug, Clone)]
 /// An RGSW ciphertext.
 /// It is a wrapper around `StandardGgswCiphertext` from concrete.
-pub struct RGSWCiphertext(pub(crate) StandardGgswCiphertext<ScalarContainer>);
+pub struct RGSWCiphertext(pub StandardGgswCiphertext<ScalarContainer>);
 
 impl RGSWCiphertext {
     pub fn allocate(
