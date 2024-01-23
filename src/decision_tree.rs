@@ -13,6 +13,7 @@ use concrete_core::{
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    cmp::max,
     collections::HashMap,
     fmt::{Display, Formatter},
     time::{Duration, Instant},
@@ -43,6 +44,7 @@ pub enum Op {
 /// A node in the tree.
 pub enum Node {
     Internal(Box<Internal>),
+    //label inside leaf
     Leaf(usize),
 }
 
@@ -53,10 +55,26 @@ impl Default for Node {
         gen_full_tree(1, &mut processed_one_leaf)
     }
 }
+impl Clone for Node {
+    fn clone(&self) -> Node {
+        match self {
+            Node::Internal(n) => Node::Internal(Box::new(Internal {
+                threshold: n.threshold,
+                feature: n.feature,
+                index: n.index,
+                op: n.op,
+                left: n.left.clone(),
+                right: n.right.clone(),
+            })),
+
+            Node::Leaf(label) => Node::Leaf(*label),
+        }
+    }
+}
 
 impl Node {
     /// Turn the node to an Internal, panic if it's a leaf.
-    pub fn unwrap(self) -> Internal {
+    pub fn inner_value(self) -> Internal {
         match self {
             Self::Internal(x) => *x,
             Self::Leaf(_) => panic!("this is a leaf"),
@@ -100,7 +118,15 @@ impl Node {
     /// Count the number of leaves.
     pub fn count_leaf(&self) -> usize {
         match self {
-            Self::Internal(internal) => internal.left.count_leaf() + internal.right.count_leaf(),
+            Self::Internal(internal) => {
+                (match &internal.left {
+                    Some(node) => node.count_leaf(),
+                    None => 0,
+                }) + (match &internal.right {
+                    Some(node) => node.count_leaf(),
+                    None => 0,
+                })
+            }
             Self::Leaf(_) => 1,
         }
     }
@@ -109,7 +135,18 @@ impl Node {
     pub fn count_internal(&self) -> usize {
         match self {
             Self::Internal(internal) => {
-                1 + internal.left.count_internal() + internal.right.count_internal()
+                let c = 1
+                    + internal
+                        .left
+                        .as_ref()
+                        .unwrap_or(&Self::Leaf(0))
+                        .count_internal()
+                    + internal
+                        .right
+                        .as_ref()
+                        .unwrap_or(&Self::Leaf(0))
+                        .count_internal();
+                c
             }
             Self::Leaf(_) => 0,
         }
@@ -119,8 +156,16 @@ impl Node {
     pub fn count_depth(&self) -> usize {
         match self {
             Self::Internal(internal) => {
-                let l = internal.left.count_depth();
-                let r = internal.right.count_depth();
+                let l = internal
+                    .left
+                    .as_ref()
+                    .unwrap_or(&Self::Leaf(0))
+                    .count_depth();
+                let r = internal
+                    .right
+                    .as_ref()
+                    .unwrap_or(&Self::Leaf(0))
+                    .count_depth();
                 if l > r {
                     l + 1
                 } else {
@@ -136,8 +181,20 @@ impl Node {
         match self {
             Self::Internal(internal) => {
                 let i = internal.feature;
-                i.max(internal.left.max_feature_index())
-                    .max(internal.right.max_feature_index())
+                i.max(
+                    internal
+                        .left
+                        .as_ref()
+                        .unwrap_or(&Self::Leaf(0))
+                        .max_feature_index(),
+                )
+                .max(
+                    internal
+                        .right
+                        .as_ref()
+                        .unwrap_or(&Self::Leaf(0))
+                        .max_feature_index(),
+                )
             }
             Self::Leaf(_) => 0,
         }
@@ -152,19 +209,19 @@ pub struct Internal {
     pub feature: usize,
     pub index: usize,
     pub op: Op,
-    pub left: Node,
-    pub right: Node,
+    pub left: Option<Node>,
+    pub right: Option<Node>,
 }
 
 fn fix_index(node: &mut Internal, i: usize) -> usize {
     node.index = i;
     let j = match &mut node.left {
-        Node::Leaf(_) => i,
-        Node::Internal(left) => fix_index(left, i + 1),
+        Some(Node::Leaf(_)) | None => i,
+        Some(Node::Internal(left)) => fix_index(left, i + 1),
     };
     match &mut node.right {
-        Node::Leaf(_) => j,
-        Node::Internal(right) => fix_index(right, j + 1),
+        Some(Node::Leaf(_)) | None => j,
+        Some(Node::Internal(right)) => fix_index(right, j + 1),
     }
 }
 
@@ -174,16 +231,16 @@ fn flatten_tree(out: &mut Vec<Internal>, node: &Internal) {
         feature: node.feature,
         index: node.index,
         op: node.op,
-        left: Node::Leaf(0),
-        right: Node::Leaf(0),
+        left: Some(Node::Leaf(0)),
+        right: Some(Node::Leaf(0)),
     });
     match &node.left {
-        Node::Leaf(_) => (),
-        Node::Internal(left) => flatten_tree(out, left),
+        Some(Node::Leaf(_)) | None => (),
+        Some(Node::Internal(left)) => flatten_tree(out, left),
     }
     match &node.right {
-        Node::Leaf(_) => (),
-        Node::Internal(right) => flatten_tree(out, right),
+        Some(Node::Leaf(_)) | None => (),
+        Some(Node::Internal(right)) => flatten_tree(out, right),
     }
 }
 
@@ -195,11 +252,23 @@ fn eval_node(out: &mut usize, node: &Node, features: &Vec<usize>, b: usize) {
         Node::Internal(node) => match node.op {
             Op::LEQ => {
                 if features[node.feature] <= node.threshold {
-                    eval_node(out, &node.left, features, b);
-                    eval_node(out, &node.right, features, b * (1 - b));
+                    match &node.left {
+                        Some(left) => eval_node(out, &left, features, b),
+                        None => (),
+                    };
+                    match &node.right {
+                        Some(right) => eval_node(out, &right, features, b * (1 - b)),
+                        None => (),
+                    };
                 } else {
-                    eval_node(out, &node.left, features, b * (1 - b));
-                    eval_node(out, &node.right, features, b);
+                    match &node.left {
+                        Some(left) => eval_node(out, &left, features, b * (1 - b)),
+                        None => (),
+                    };
+                    match &node.right {
+                        Some(right) => eval_node(out, &right, features, b),
+                        None => (),
+                    };
                 }
             }
             Op::GT => todo!(),
@@ -221,9 +290,38 @@ fn gen_full_tree(d: usize, processed_one_leaf: &mut bool) -> Node {
             feature: 0,
             index: 0,
             op: Op::LEQ,
-            left: gen_full_tree(d - 1, processed_one_leaf),
-            right: gen_full_tree(d - 1, processed_one_leaf),
+            left: Some(gen_full_tree(d - 1, processed_one_leaf)),
+            right: Some(gen_full_tree(d - 1, processed_one_leaf)),
         }))
+    }
+}
+
+pub fn trunc_tree(root: &Option<Node>) -> Option<Node> {
+    match root {
+        Some(Node::Internal(node)) => {
+            let left_side = trunc_tree(&node.left);
+            let right_side = trunc_tree(&node.right);
+
+            match (&left_side, &right_side) {
+                (None, None) => None,
+                _ => Some(Node::Internal(Box::new(Internal {
+                    threshold: node.threshold,
+                    feature: node.feature,
+                    index: node.index,
+                    op: node.op,
+                    left: left_side,
+                    right: right_side,
+                }))),
+            }
+        }
+        Some(Node::Leaf(label)) => {
+            if *label == 0 {
+                None
+            } else {
+                Some(Node::Leaf(*label))
+            }
+        }
+        None => None,
     }
 }
 
@@ -265,8 +363,8 @@ impl EncNode {
         let ct = rgsw_cts.next().unwrap();
         let mut out = EncInternal {
             ct,
-            left: Self::Leaf(0),
-            right: Self::Leaf(0),
+            left: Some(Self::Leaf(0)),
+            right: Some(Self::Leaf(0)),
         };
         match clear_root {
             Node::Internal(inner) => new_enc_node(&mut out, inner, rgsw_cts),
@@ -291,12 +389,21 @@ impl EncNode {
     pub fn max_leaf(&self) -> usize {
         match self {
             Self::Internal(internal) => {
-                let l = internal.left.max_leaf();
-                let r = internal.right.max_leaf();
-                if l > r {
-                    l
-                } else {
-                    r
+                let l = match &internal.left {
+                    Some(left) => Some(left.max_leaf()),
+                    None => None,
+                };
+
+                let r = match &internal.right {
+                    Some(right) => Some(right.max_leaf()),
+                    None => None,
+                };
+
+                match (l, r) {
+                    (Some(left), Some(right)) => max(left, right),
+                    (None, Some(right)) => right,
+                    (Some(left), None) => left,
+                    (None, None) => 0,
                 }
             }
             Self::Leaf(x) => *x,
@@ -307,8 +414,8 @@ impl EncNode {
 /// An encrypted internal node where the ciphertext is the choice bit.
 pub struct EncInternal {
     pub ct: RGSWCiphertext,
-    pub left: EncNode,
-    pub right: EncNode,
+    pub left: Option<EncNode>,
+    pub right: Option<EncNode>,
 }
 
 fn new_enc_node(
@@ -317,34 +424,36 @@ fn new_enc_node(
     rgsw_cts: &mut impl Iterator<Item = RGSWCiphertext>,
 ) {
     match &clear_node.left {
-        Node::Leaf(x) => enc_node.left = EncNode::Leaf(*x),
-        Node::Internal(left) => match rgsw_cts.next() {
+        Some(Node::Leaf(x)) => enc_node.left = Some(EncNode::Leaf(*x)),
+        Some(Node::Internal(left)) => match rgsw_cts.next() {
             None => panic!("missing RGSW ciphertext"),
             Some(ct) => {
                 let mut new_node = EncInternal {
                     ct,
-                    left: EncNode::Leaf(0),
-                    right: EncNode::Leaf(0),
+                    left: Some(EncNode::Leaf(0)),
+                    right: Some(EncNode::Leaf(0)),
                 };
                 new_enc_node(&mut new_node, left, rgsw_cts);
-                enc_node.left = EncNode::Internal(Box::new(new_node));
+                enc_node.left = Some(EncNode::Internal(Box::new(new_node)));
             }
         },
+        None => (),
     }
     match &clear_node.right {
-        Node::Leaf(x) => enc_node.right = EncNode::Leaf(*x),
-        Node::Internal(right) => match rgsw_cts.next() {
+        Some(Node::Leaf(x)) => enc_node.right = Some(EncNode::Leaf(*x)),
+        Some(Node::Internal(right)) => match rgsw_cts.next() {
             None => panic!("missing RGSW ciphertext"),
             Some(ct) => {
                 let mut new_node = EncInternal {
                     ct,
-                    left: EncNode::Leaf(0),
-                    right: EncNode::Leaf(0),
+                    left: Some(EncNode::Leaf(0)),
+                    right: Some(EncNode::Leaf(0)),
                 };
                 new_enc_node(&mut new_node, right, rgsw_cts);
-                enc_node.right = EncNode::Internal(Box::new(new_node));
+                enc_node.right = Some(EncNode::Internal(Box::new(new_node)));
             }
         },
+        None => (),
     }
 }
 
@@ -369,8 +478,14 @@ fn eval_enc_node(
             let mut right = b;
             right.update_with_sub(&left);
 
-            eval_enc_node(out, &node.left, left, ctx, buf);
-            eval_enc_node(out, &node.right, right, ctx, buf);
+            match &node.left {
+                Some(left_child) => eval_enc_node(out, &left_child, left, ctx, buf),
+                None => (),
+            }
+            match &node.right {
+                Some(right_child) => eval_enc_node(out, &right_child, right, ctx, buf),
+                None => (),
+            }
         }
     }
 }
@@ -616,15 +731,15 @@ mod test {
             feature: 2,
             index: 4,
             op: Op::LEQ,
-            left: Node::Internal(Box::new(Internal {
+            left: Some(Node::Internal(Box::new(Internal {
                 threshold: 11,
                 feature: 22,
                 index: 44,
                 op: Op::GT,
-                left: Node::Leaf(1),
-                right: Node::Leaf(2),
-            })),
-            right: Node::Leaf(3),
+                left: Some(Node::Leaf(1)),
+                right: Some(Node::Leaf(2)),
+            }))),
+            right: Some(Node::Leaf(3)),
         }));
         assert_eq!(
             r#"{"internal":{"threshold":1,"feature":2,"index":4,"op":"leq","left":{"internal":{"threshold":11,"feature":22,"index":44,"op":"gt","left":{"leaf":1},"right":{"leaf":2}}},"right":{"leaf":3}}}"#,
@@ -639,15 +754,15 @@ mod test {
             feature: 2,
             index: 4,
             op: Op::LEQ,
-            left: Node::Internal(Box::new(Internal {
+            left: Some(Node::Internal(Box::new(Internal {
                 threshold: 11,
                 feature: 22,
                 index: 44,
                 op: Op::GT,
-                left: Node::Leaf(0),
-                right: Node::default(),
-            })),
-            right: Node::Leaf(0),
+                left: Some(Node::Leaf(0)),
+                right: Some(Node::default()),
+            }))),
+            right: Some(Node::Leaf(0)),
         }));
 
         assert_eq!(root.fix_index(), 2);
@@ -655,11 +770,11 @@ mod test {
             assert_eq!(x.index, i);
         }
 
-        let internal = root.unwrap();
+        let internal = root.inner_value();
         assert_eq!(internal.index, 0);
-        let left = internal.left.unwrap();
+        let left = internal.left.unwrap().inner_value();
         assert_eq!(left.index, 1);
-        let right = left.right.unwrap();
+        let right = left.right.unwrap().inner_value();
         assert_eq!(right.index, 2);
     }
 
@@ -680,22 +795,22 @@ mod test {
                 feature: 0,
                 index: 0,
                 op: Op::LEQ,
-                left: Node::Internal(Box::new(Internal {
+                left: Some(Node::Internal(Box::new(Internal {
                     threshold: 2,
                     feature: 1,
                     index: 0,
                     op: Op::LEQ,
-                    left: Node::Leaf(0),
-                    right: Node::Internal(Box::new(Internal {
+                    left: Some(Node::Leaf(0)),
+                    right: Some(Node::Internal(Box::new(Internal {
                         threshold: 3,
                         feature: 1,
                         index: 0,
                         op: Op::LEQ,
-                        left: Node::Leaf(10),
-                        right: Node::Leaf(0),
-                    })),
-                })),
-                right: Node::Leaf(0),
+                        left: Some(Node::Leaf(10)),
+                        right: Some(Node::Leaf(0)),
+                    }))),
+                }))),
+                right: Some(Node::Leaf(0)),
             }));
             assert_eq!(tmp.fix_index(), 2);
             tmp
@@ -727,22 +842,22 @@ mod test {
                 feature: 0,
                 index: 0,
                 op: Op::LEQ,
-                left: Node::Internal(Box::new(Internal {
+                left: Some(Node::Internal(Box::new(Internal {
                     threshold: 2,
                     feature: 1,
                     index: 0,
                     op: Op::LEQ,
-                    left: Node::Leaf(1),
-                    right: Node::Internal(Box::new(Internal {
+                    left: Some(Node::Leaf(1)),
+                    right: Some(Node::Internal(Box::new(Internal {
                         threshold: 1,
                         feature: 1,
                         index: 0,
                         op: Op::LEQ,
-                        left: Node::Leaf(1),
-                        right: Node::Leaf(0),
-                    })),
-                })),
-                right: Node::Leaf(1),
+                        left: Some(Node::Leaf(1)),
+                        right: Some(Node::Leaf(0)),
+                    }))),
+                }))),
+                right: Some(Node::Leaf(1)),
             }));
             assert_eq!(tmp.fix_index(), 2);
             tmp
@@ -770,8 +885,8 @@ mod test {
                     feature: 0,
                     index: 0,
                     op: Op::LEQ,
-                    left: gen_line(d - 1),
-                    right: Node::Leaf(0),
+                    left: Some(gen_line(d - 1)),
+                    right: Some(Node::Leaf(0)),
                 }))
             }
         }
