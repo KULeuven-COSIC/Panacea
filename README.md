@@ -31,34 +31,7 @@ cargo build --release
 ```
 cargo test --release
 ```
-### Special Instructions Mac computers with ARM Chips
-To build natively on Mac computers with ARM chips (e.g., M1 and M2),
-the Rust nightly toolchain (1.68 or above) must be used.
-This can be installed by running
-```
-rustup toolchain install nightly
-```
 
-Additionally, `.cargo/config.toml` should be modified by swapping the commented lines so that it looks like this:
-```
-[build]
-# rustflags = ["-C", "target-cpu=native"]
-rustflags = ["-C", "target-cpu=apple-m1"]
-```
-
-For convenience, you can execute the following command so that the nightly toolchain is always used under the repo's directory
-```
-rustup override set nightly 
-```
-Then you can compile and test using the commands above.
-
-Otherwise, you can use the `+nightly` modifier with `cargo` every time to specify the desired toolchain
-```
-# To install:
-cargo +nightly build --release
-# To test:
-cargo +nightly test --release
-```
 ## Running
 
 ### Getting the CLI options
