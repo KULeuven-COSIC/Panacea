@@ -2,21 +2,29 @@ use crate::{
     context::{Context, FftBuffer},
     decision_tree::{bit_decomposed_rgsw, demux_with},
     naive_hash::NaiveHash,
-    num_types::{One, Scalar, Zero},
+    num_types::{AlignedScalarContainer, ComplexBox, One, Scalar, ScalarContainer, Zero},
     params::TFHEParameters,
-    rgsw::RGSWCiphertext,
-    rlwe::{decomposed_rlwe_to_rgsw, RLWECiphertext, RLWESecretKey},
-    utils::pt_to_lossy_u64,
+    rlwe::{convert_standard_ggsw_to_fourier, decomposed_rlwe_to_rgsw, neg_gsw_std},
     utils::transpose,
+    utils::{flatten_fourier_ggsw, pt_to_lossy_u64},
 };
-use concrete_core::commons::{
-    crypto::encoding::{Plaintext, PlaintextList},
-    math::tensor::AsMutTensor,
-};
+
+use aligned_vec::avec;
+use dyn_stack::ReborrowMut;
 use rayon::prelude::*;
 use std::{
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
+};
+
+use tfhe::core_crypto::{
+    entities::FourierGgswCiphertext,
+    prelude::{
+        add_external_product_assign_mem_optimized, cmux_assign_mem_optimized,
+        decrypt_glwe_ciphertext, encrypt_glwe_ciphertext, glwe_ciphertext_add_assign,
+        glwe_ciphertext_sub_assign, par_encrypt_constant_ggsw_ciphertext, GgswCiphertext,
+        GlweCiphertext, GlweSecretKey, Plaintext, PlaintextList,
+    },
 };
 
 struct FftBufferPool {
@@ -24,7 +32,7 @@ struct FftBufferPool {
 }
 
 impl FftBufferPool {
-    fn new(max_size: usize, ctx: &Context) -> Self {
+    fn new(max_size: usize, ctx: &Context<Scalar>) -> Self {
         Self {
             pool: (0..max_size)
                 .map(|_| Arc::new(Mutex::new(ctx.gen_fft_ctx())))
@@ -33,7 +41,7 @@ impl FftBufferPool {
     }
 }
 
-struct EncOP(RGSWCiphertext);
+struct EncOP(GgswCiphertext<ScalarContainer>);
 
 enum OP {
     READ,
@@ -42,23 +50,27 @@ enum OP {
 
 /// The client's encrypted query.
 pub struct ClientQuery {
-    a: Vec<RGSWCiphertext>,
+    a: Vec<GgswCiphertext<ScalarContainer>>,
     op: EncOP,
-    data: RLWECiphertext,
+    data: GlweCiphertext<AlignedScalarContainer>,
 }
 
 impl ClientQuery {
     /// Turn the `op` field into a single RGSW ciphertext that indicates if
     /// the operation is a read (0) or a write (1).
-    fn into_rw_flag(self) -> RGSWCiphertext {
-        self.op.0
+    fn into_rw_flag(
+        self,
+        ctx: &Context<Scalar>,
+        buf: &mut FftBuffer,
+    ) -> FourierGgswCiphertext<ComplexBox> {
+        convert_standard_ggsw_to_fourier(self.op.0, ctx, buf)
     }
 }
 
 /// ORAM client state.
 pub struct Client {
-    pub sk: RLWESecretKey,
-    pub ctx: Context,
+    pub sk: GlweSecretKey<ScalarContainer>,
+    pub ctx: Context<Scalar>,
     pub rows: usize,
     pub cols: usize,
 }
@@ -69,7 +81,13 @@ impl Client {
     /// number of hash functions.
     pub fn new(rows: usize, cols: usize, params: TFHEParameters) -> Self {
         let mut ctx = Context::new(params);
-        let sk = ctx.gen_rlwe_sk();
+
+        let sk = GlweSecretKey::generate_new_binary(
+            ctx.glwe_dimension,
+            ctx.poly_size,
+            &mut ctx.secret_generator,
+        );
+
         Self {
             sk,
             ctx,
@@ -78,19 +96,17 @@ impl Client {
         }
     }
 
-    /// Generate the -s keyswitching key.
-    pub fn gen_neg_sk(&mut self) -> RGSWCiphertext {
-        self.sk.neg_gsw(&mut self.ctx)
-    }
-
     /// Generate a dummy database for performance testing.
     pub fn gen_dummy_database(
         &mut self,
         hash: &NaiveHash,
-    ) -> (Vec<PlaintextList<Vec<Scalar>>>, Vec<Vec<RLWECiphertext>>) {
+    ) -> (
+        Vec<PlaintextList<ScalarContainer>>,
+        Vec<Vec<GlweCiphertext<AlignedScalarContainer>>>,
+    ) {
         // TODO put NaiveHash in Client struct
         let item_count = self.rows * self.cols / hash.h_count();
-        let mut db = vec![vec![RLWECiphertext::allocate(self.ctx.poly_size); self.cols]; self.rows];
+        let mut db = vec![vec![self.ctx.empty_glwe_ciphertext(); self.cols]; self.rows];
 
         // to make sure it doesn't take a long time to create a dummy database
         // we encrypt at most UNIQUE_LIMIT elements and put them in the first UNIQUE_LIMIT indices
@@ -102,26 +118,34 @@ impl Client {
             UNIQUE_LIMIT
         };
 
-        let mut pts: Vec<PlaintextList<Vec<Scalar>>> = (0..unique_count)
+        let mut pts: Vec<PlaintextList<ScalarContainer>> = (0..unique_count)
             .map(|i| {
-                let pt_i = self.ctx.gen_pt();
+                let mut pt_i = self.ctx.gen_pt();
+                let pt_i_clone = pt_i.clone();
                 // encrypt the plaintext at index i and place
                 // in the location computed by the first hash function
                 let (first_r, first_c) = hash.hash_to_tuple(0, i, self.cols);
                 assert!(first_r < self.rows && first_c < self.cols);
-                self.sk
-                    .encode_encrypt_rlwe(&mut db[first_r][first_c], &pt_i, &mut self.ctx);
-                pt_i
+
+                self.ctx.codec.poly_encode(&mut pt_i.as_mut_polynomial());
+
+                encrypt_glwe_ciphertext(
+                    &self.sk,
+                    &mut db[first_r][first_c],
+                    &pt_i,
+                    self.ctx.std,
+                    &mut self.ctx.encryption_generator,
+                );
+                pt_i_clone
             })
             .collect();
-        let mut rest: Vec<PlaintextList<Vec<Scalar>>> = (unique_count..item_count)
+        let mut rest: Vec<PlaintextList<ScalarContainer>> = (unique_count..item_count)
             .map(|i| {
-                let item = pts[i % UNIQUE_LIMIT].clone();
                 let (orig_first_r, orig_first_c) =
                     hash.hash_to_tuple(0, i % UNIQUE_LIMIT, self.cols);
                 let (first_r, first_c) = hash.hash_to_tuple(0, i, self.cols);
                 db[first_r][first_c] = db[orig_first_r][orig_first_c].clone();
-                item
+                pts[i % UNIQUE_LIMIT].clone()
             })
             .collect();
         pts.append(&mut rest);
@@ -141,20 +165,44 @@ impl Client {
     }
 
     fn gen_enc_op(&mut self, op: &OP) -> EncOP {
-        let mut enc: RGSWCiphertext =
-            RGSWCiphertext::allocate(self.ctx.poly_size, self.ctx.base_log, self.ctx.level_count);
+        let mut enc = GgswCiphertext::<ScalarContainer>::new(
+            Scalar::zero(),
+            self.ctx.glwe_size,
+            self.ctx.poly_size,
+            self.ctx.base_log,
+            self.ctx.level_count,
+            self.ctx.ciphertext_modulus,
+        );
         let pt = match op {
             OP::READ => Plaintext(Scalar::zero()),
             OP::WRITE => Plaintext(Scalar::one()),
         };
+        par_encrypt_constant_ggsw_ciphertext(
+            &self.sk,
+            &mut enc,
+            pt,
+            self.ctx.std,
+            &mut self.ctx.encryption_generator,
+        );
 
-        self.sk.encrypt_constant_rgsw(&mut enc, &pt, &mut self.ctx);
         EncOP(enc)
     }
 
-    fn enc_data_rlwe(&mut self, alpha: &PlaintextList<Vec<Scalar>>) -> RLWECiphertext {
-        let mut out: RLWECiphertext = RLWECiphertext::allocate(self.ctx.poly_size);
-        self.sk.encode_encrypt_rlwe(&mut out, alpha, &mut self.ctx);
+    fn enc_data_rlwe(
+        &mut self,
+        mut alpha: PlaintextList<ScalarContainer>,
+    ) -> GlweCiphertext<AlignedScalarContainer> {
+        let mut out: GlweCiphertext<AlignedScalarContainer> = self.ctx.empty_glwe_ciphertext();
+
+        self.ctx.codec.poly_encode(&mut alpha.as_mut_polynomial());
+
+        encrypt_glwe_ciphertext(
+            &self.sk,
+            &mut out,
+            &alpha,
+            self.ctx.std,
+            &mut self.ctx.encryption_generator,
+        );
         out
     }
 
@@ -166,7 +214,7 @@ impl Client {
         ClientQuery {
             a,
             op: self.gen_enc_op(&OP::READ),
-            data: self.enc_data_rlwe(&dummy_data),
+            data: self.enc_data_rlwe(dummy_data),
         }
     }
 
@@ -190,7 +238,7 @@ impl Client {
             .collect()
     }
 
-    fn make_write_query(&mut self, i: usize, alpha: &PlaintextList<Vec<Scalar>>) -> ClientQuery {
+    fn make_write_query(&mut self, i: usize, alpha: PlaintextList<ScalarContainer>) -> ClientQuery {
         // let item_count = self.rows * self.cols / hash.h_count();
         let a = bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx);
         ClientQuery {
@@ -204,7 +252,7 @@ impl Client {
     pub fn gen_write_query_one(
         &mut self,
         i: usize,
-        alpha: &PlaintextList<Vec<Scalar>>,
+        alpha: PlaintextList<ScalarContainer>,
         hash: &NaiveHash,
     ) -> ClientQuery {
         self.gen_write_query_batch(&[i], alpha, hash).remove(0)
@@ -214,14 +262,14 @@ impl Client {
     pub fn gen_write_query_batch(
         &mut self,
         indices: &[usize],
-        alpha: &PlaintextList<Vec<Scalar>>,
+        alpha: PlaintextList<ScalarContainer>,
         hash: &NaiveHash,
     ) -> Vec<ClientQuery> {
         // TODO use multiple alphas
         let mapping = hash.hash_to_mapping(indices, self.cols);
         (0..self.rows)
             .map(|r| match mapping.get(&r) {
-                Some(c) => self.make_write_query(c.0, alpha),
+                Some(c) => self.make_write_query(c.0, alpha.clone()),
                 None => self.make_read_query(0),
             })
             .collect()
@@ -230,37 +278,66 @@ impl Client {
 
 fn rw(
     op: &EncOP,
-    a: &RLWECiphertext,
-    b: &RLWECiphertext,
-    ctx: &Context,
+    a: &GlweCiphertext<AlignedScalarContainer>,
+    b: &GlweCiphertext<AlignedScalarContainer>,
+    ctx: &Context<Scalar>,
     buf: &mut FftBuffer,
-) -> RLWECiphertext {
-    let mut c0 = RLWECiphertext::allocate(ctx.poly_size);
-    op.0.cmux_with_buf(&mut c0, b, a, buf);
+) -> GlweCiphertext<AlignedScalarContainer> {
+    let mut c0 = b.clone();
+    let fourier_op = convert_standard_ggsw_to_fourier(op.0.clone(), ctx, buf);
+
+    cmux_assign_mem_optimized(
+        &mut c0,
+        &mut a.clone(),
+        &fourier_op,
+        ctx.fft.as_view(),
+        buf.mem.stack().rb_mut(),
+    );
+
     c0
 }
 
 // process one query
 fn process_one_mt(
     query: &ClientQuery,
-    data: Arc<RwLock<Vec<RLWECiphertext>>>,
-    neg_s: &RGSWCiphertext,
+    data: Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>,
+    neg_s: FourierGgswCiphertext<ComplexBox>,
     buf: &FftBufferPool,
-    ctx: &Context,
-) -> (RLWECiphertext, Vec<RGSWCiphertext>) {
+    ctx: &Context<Scalar>,
+) -> (
+    GlweCiphertext<AlignedScalarContainer>,
+    Vec<FourierGgswCiphertext<ComplexBox>>,
+) {
     let f = |level: usize| {
         let tid = rayon::current_thread_index().unwrap();
-        let mut c = RLWECiphertext::allocate(ctx.poly_size);
+        let mut c = ctx.empty_glwe_ciphertext();
         let shift: usize = (Scalar::BITS as usize) - ctx.base_log.0 * level;
-        *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one() << shift;
-
-        let tmp = demux_with(c, &query.a, ctx, &mut buf.pool[tid].clone().lock().unwrap());
+        // *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one() << shift;
+        (*c.get_mut_body().as_mut())[0] = Scalar::one() << shift;
+        let query_a_fourier = query
+            .a
+            .iter()
+            .map(|ct| {
+                convert_standard_ggsw_to_fourier(
+                    ct.clone(),
+                    &ctx,
+                    &mut buf.pool[tid].clone().lock().unwrap(),
+                )
+            })
+            .collect();
+        let tmp = demux_with(
+            c,
+            &query_a_fourier,
+            ctx,
+            &mut buf.pool[tid].clone().lock().unwrap(),
+        );
         assert_eq!(tmp.len(), 1 << query.a.len());
         tmp
     };
 
     let levels = (1..=ctx.level_count.0).collect::<Vec<usize>>();
-    let demux_res: Vec<Vec<RLWECiphertext>> = levels.par_iter().map(|level| f(*level)).collect();
+    let demux_res: Vec<Vec<GlweCiphertext<AlignedScalarContainer>>> =
+        levels.par_iter().map(|level| f(*level)).collect();
 
     // NOTE: can we parallelize transpose?
     let decomposed_l = transpose(demux_res);
@@ -271,30 +348,35 @@ fn process_one_mt(
         let tid = rayon::current_thread_index().unwrap();
         let l = decomposed_rlwe_to_rgsw(
             &decomposed_l[j],
-            neg_s,
+            &neg_s,
             ctx,
             &mut buf.pool[tid].clone().lock().unwrap(),
         );
 
         // compute the partial response
-        let mut tmp = RLWECiphertext::allocate(ctx.poly_size);
-        l.external_product_with_buf(
+        let mut tmp = ctx.empty_glwe_ciphertext();
+
+        add_external_product_assign_mem_optimized(
             &mut tmp,
+            &l,
             &data.clone().read().unwrap()[j],
-            &mut buf.pool[tid].clone().lock().unwrap(),
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
 
         (tmp, l)
     };
 
     let indices = (0..cols).collect::<Vec<usize>>();
-    let (tmps, ls): (Vec<RLWECiphertext>, Vec<RGSWCiphertext>) =
-        indices.par_iter().map(|j| g(*j)).unzip();
+    let (tmps, ls): (
+        Vec<GlweCiphertext<AlignedScalarContainer>>,
+        Vec<FourierGgswCiphertext<ComplexBox>>,
+    ) = indices.par_iter().map(|j| g(*j)).unzip();
 
     let y = tmps.into_par_iter().reduce(
-        || RLWECiphertext::allocate(ctx.poly_size),
+        || ctx.empty_glwe_ciphertext(),
         |mut a, b| {
-            a.update_with_add(&b);
+            glwe_ciphertext_add_assign(&mut a, &b);
             a
         },
     );
@@ -304,14 +386,14 @@ fn process_one_mt(
 // multi threaded with a single query
 fn update_db_mt(
     query: &ClientQuery,
-    data: Arc<RwLock<Vec<RLWECiphertext>>>,
-    ls: Vec<RGSWCiphertext>,
+    data: Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>,
+    ls: Vec<FourierGgswCiphertext<ComplexBox>>,
     buf: &FftBufferPool,
-    ctx: &Context,
+    ctx: &Context<Scalar>,
 ) {
-    let g = |j: usize, l: &RGSWCiphertext| {
+    let g = |j: usize, l: &FourierGgswCiphertext<ComplexBox>| {
         let tid = rayon::current_thread_index().unwrap();
-        let tmp: RLWECiphertext = rw(
+        let mut tmp: GlweCiphertext<AlignedScalarContainer> = rw(
             &query.op,
             &query.data,
             &data.clone().read().unwrap()[j],
@@ -320,14 +402,13 @@ fn update_db_mt(
         );
 
         // update the database at index j
-        let mut new_data: RLWECiphertext = RLWECiphertext::allocate(ctx.poly_size);
-        l.cmux_with_buf(
-            &mut new_data,
-            &data.clone().read().unwrap()[j],
-            &tmp,
-            &mut buf.pool[tid].clone().lock().unwrap(),
+        cmux_assign_mem_optimized(
+            &mut data.clone().write().unwrap()[j],
+            &mut tmp,
+            &l,
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
-        data.clone().write().unwrap()[j].fill_with_copy(&new_data);
     };
 
     let cols = data.read().unwrap().len();
@@ -342,19 +423,37 @@ fn update_db_mt(
 // we avoid this in the single threaded implementation
 fn process_one_st(
     query: &ClientQuery,
-    data: Arc<RwLock<Vec<RLWECiphertext>>>,
-    neg_s: &RGSWCiphertext,
+    data: Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>,
+    neg_s: &FourierGgswCiphertext<ComplexBox>,
     buf: &FftBufferPool,
-    ctx: &Context,
-) -> (RLWECiphertext, Vec<RGSWCiphertext>) {
-    let mut demux_res: Vec<Vec<RLWECiphertext>> = vec![];
+    ctx: &Context<Scalar>,
+) -> (
+    GlweCiphertext<AlignedScalarContainer>,
+    Vec<FourierGgswCiphertext<ComplexBox>>,
+) {
+    let mut demux_res: Vec<Vec<GlweCiphertext<AlignedScalarContainer>>> = vec![];
     let tid = rayon::current_thread_index().unwrap();
     for level in 1..=ctx.level_count.0 {
-        let mut c = RLWECiphertext::allocate(ctx.poly_size);
+        let mut c = ctx.empty_glwe_ciphertext();
         let shift: usize = (Scalar::BITS as usize) - ctx.base_log.0 * level;
-        *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one() << shift;
+        (*c.get_mut_body().as_mut())[0] = Scalar::one() << shift;
 
-        let tmp = demux_with(c, &query.a, ctx, &mut buf.pool[tid].clone().lock().unwrap());
+        let tmp = demux_with(
+            c,
+            &query
+                .a
+                .iter()
+                .map(|ct| {
+                    convert_standard_ggsw_to_fourier(
+                        ct.clone(),
+                        ctx,
+                        &mut buf.pool[tid].clone().lock().unwrap(),
+                    )
+                })
+                .collect(),
+            ctx,
+            &mut buf.pool[tid].clone().lock().unwrap(),
+        );
         assert_eq!(tmp.len(), 1 << query.a.len());
         demux_res.push(tmp);
     }
@@ -363,22 +462,25 @@ fn process_one_st(
     let decomposed_l = transpose(demux_res);
     assert_eq!(decomposed_l.len(), cols);
 
-    let mut y: RLWECiphertext = RLWECiphertext::allocate(ctx.poly_size);
-    let mut ls: Vec<RGSWCiphertext> =
-        vec![RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count); cols];
+    let mut y: GlweCiphertext<AlignedScalarContainer> = ctx.empty_glwe_ciphertext();
+    let mut ls: Vec<FourierGgswCiphertext<ComplexBox>> = Vec::new();
+    ls.reserve_exact(cols);
     for j in 0..cols {
         // compute the output y
         // note that external_product adds to the output buffer
-        ls[j] = decomposed_rlwe_to_rgsw(
+        ls.push(decomposed_rlwe_to_rgsw(
             &decomposed_l[j],
             neg_s,
             ctx,
             &mut buf.pool[tid].clone().lock().unwrap(),
-        );
-        ls[j].external_product_with_buf(
+        ));
+
+        add_external_product_assign_mem_optimized(
             &mut y,
+            &ls[j],
             &data.clone().read().unwrap()[j],
-            &mut buf.pool[tid].clone().lock().unwrap(),
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
     }
     (y, ls)
@@ -386,16 +488,16 @@ fn process_one_st(
 
 fn update_db_st(
     query: &ClientQuery,
-    data: Arc<RwLock<Vec<RLWECiphertext>>>,
-    ls: &Vec<RGSWCiphertext>,
+    data: Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>,
+    ls: &Vec<FourierGgswCiphertext<ComplexBox>>,
     buf: &FftBufferPool,
-    ctx: &Context,
+    ctx: &Context<Scalar>,
 ) {
     let tid = rayon::current_thread_index().unwrap();
     let cols = data.read().unwrap().len();
     for j in 0..cols {
         // update the database at index j
-        let tmp = rw(
+        let mut tmp = rw(
             &query.op,
             &query.data,
             &data.clone().read().unwrap()[j],
@@ -403,28 +505,27 @@ fn update_db_st(
             &mut buf.pool[tid].clone().lock().unwrap(),
         );
 
-        let mut new_data = RLWECiphertext::allocate(ctx.poly_size);
-        ls[j].cmux_with_buf(
-            &mut new_data,
-            &data.clone().read().unwrap()[j],
-            &tmp,
-            &mut buf.pool[tid].clone().lock().unwrap(),
-        ); // 0 -> self.data, 1 -> tmp
-        data.clone().write().unwrap()[j].fill_with_copy(&new_data);
+        cmux_assign_mem_optimized(
+            &mut data.clone().write().unwrap()[j],
+            &mut tmp,
+            &ls[j],
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
+        );
     }
 }
 
 pub struct Server {
-    data: Vec<Arc<RwLock<Vec<RLWECiphertext>>>>,
-    neg_s: RGSWCiphertext,
-    ctx: Context,
+    data: Vec<Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>>,
+    neg_s: FourierGgswCiphertext<ComplexBox>,
+    ctx: Context<Scalar>,
 }
 
 impl Server {
     /// Create a new server that stores ciphertexts `data`.
     pub fn new(
-        data: Vec<Vec<RLWECiphertext>>,
-        neg_s: RGSWCiphertext,
+        data: Vec<Vec<GlweCiphertext<AlignedScalarContainer>>>,
+        neg_s: FourierGgswCiphertext<ComplexBox>,
         params: TFHEParameters,
     ) -> Self {
         Self {
@@ -446,23 +547,38 @@ impl Server {
     }
 
     /// Process a single access query.
-    pub fn process_one(&mut self, query: ClientQuery) -> (RLWECiphertext, Duration) {
+    pub fn process_one(
+        &mut self,
+        query: ClientQuery,
+    ) -> (GlweCiphertext<AlignedScalarContainer>, Duration) {
         let buf = FftBufferPool::new(rayon::max_num_threads(), &self.ctx);
         let start = Instant::now();
-        let (y, ls) = process_one_mt(&query, self.data[0].clone(), &self.neg_s, &buf, &self.ctx);
+        let (y, ls) = process_one_mt(
+            &query,
+            self.data[0].clone(),
+            self.neg_s.clone(),
+            &buf,
+            &self.ctx,
+        );
         let dur = start.elapsed();
         update_db_mt(&query, self.data[0].clone(), ls, &buf, &self.ctx);
         (y, dur)
     }
 
-    /// Process multiple access queries in parallel (but without batching).
-    pub fn process_multi(&mut self, queries: Vec<ClientQuery>) -> (Vec<RLWECiphertext>, Duration) {
+    // Process multiple access queries in parallel (but without batching).
+    pub fn process_multi(
+        &mut self,
+        queries: Vec<ClientQuery>,
+    ) -> (Vec<GlweCiphertext<AlignedScalarContainer>>, Duration) {
         let buf = FftBufferPool::new(rayon::max_num_threads(), &self.ctx);
         let cols = self.cols();
         // first phase we execute the single query procedure and produce the output
         // (over multiple queries)
         let start = Instant::now();
-        let (ys, ls): (Vec<RLWECiphertext>, Vec<Vec<RGSWCiphertext>>) = queries
+        let (ys, ls): (
+            Vec<GlweCiphertext<AlignedScalarContainer>>,
+            Vec<Vec<FourierGgswCiphertext<ComplexBox>>>,
+        ) = queries
             .par_iter()
             .map(|query| process_one_st(query, self.data[0].clone(), &self.neg_s, &buf, &self.ctx))
             .unzip();
@@ -471,7 +587,7 @@ impl Server {
         // sum the output of rw*t in parallel (over multiple queries)
         let tmps = queries.into_par_iter().zip(&ls).map(|(query, l)| {
             let tid = rayon::current_thread_index().unwrap();
-            let mut out = vec![RLWECiphertext::allocate(self.ctx.poly_size); cols];
+            let mut out = vec![self.ctx.empty_glwe_ciphertext(); cols];
             for j in 0..cols {
                 let tmp = rw(
                     &query.op,
@@ -481,20 +597,23 @@ impl Server {
                     &mut buf.pool[tid].clone().lock().unwrap(),
                 );
                 // L * t
-                l[j].external_product_with_buf(
+
+                add_external_product_assign_mem_optimized(
                     &mut out[j],
+                    &l[j],
                     &tmp,
-                    &mut buf.pool[tid].clone().lock().unwrap(),
+                    self.ctx.fft.as_view(),
+                    buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
                 );
             }
             out
         });
 
         let sumed_tmps = tmps.reduce(
-            || vec![RLWECiphertext::allocate(self.ctx.poly_size); cols],
+            || vec![self.ctx.empty_glwe_ciphertext(); cols],
             |mut xs, ys| {
                 for i in 0..xs.len() {
-                    xs[i].update_with_add(&ys[i]);
+                    glwe_ciphertext_add_assign(&mut xs[i], &ys[i])
                 }
                 xs
             },
@@ -503,7 +622,8 @@ impl Server {
         let sumed_ls = ls.into_par_iter().reduce(
             || {
                 vec![
-                    RGSWCiphertext::allocate(
+                    FourierGgswCiphertext::<ComplexBox>::new(
+                        self.ctx.glwe_size,
                         self.ctx.poly_size,
                         self.ctx.base_log,
                         self.ctx.level_count
@@ -513,7 +633,19 @@ impl Server {
             },
             |mut xs, ys| {
                 for i in 0..xs.len() {
-                    xs[i].update_with_add(&ys[i]);
+                    let mut xs_i = flatten_fourier_ggsw(&xs[i]);
+                    let ys_i = flatten_fourier_ggsw(&ys[i]);
+
+                    xs_i.iter_mut()
+                        .zip(ys_i.iter())
+                        .for_each(|(xx, yy)| *xx += yy);
+                    (*xs)[i] = FourierGgswCiphertext::from_container(
+                        xs_i,
+                        self.ctx.glwe_size,
+                        self.ctx.poly_size,
+                        self.ctx.base_log,
+                        self.ctx.level_count,
+                    );
                 }
                 xs
             },
@@ -525,14 +657,14 @@ impl Server {
             .into_par_iter()
             .for_each(|j| {
                 let tid = rayon::current_thread_index().unwrap();
-                let mut new_data = RLWECiphertext::allocate(self.ctx.poly_size);
-                sumed_ls[j].cmux_with_buf(
-                    &mut new_data,
-                    &self.data[0].clone().read().unwrap()[j],
-                    &sumed_tmps[j],
-                    &mut buf.pool[tid].clone().lock().unwrap(),
+
+                cmux_assign_mem_optimized(
+                    &mut self.data[0].clone().write().unwrap()[j],
+                    &mut sumed_tmps[j].clone(),
+                    &sumed_ls[j],
+                    self.ctx.fft.as_view(),
+                    buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
                 );
-                self.data[0].clone().write().unwrap()[j].fill_with_copy(&new_data);
             });
 
         (ys, dur)
@@ -543,12 +675,16 @@ impl Server {
         &mut self,
         queries: Vec<ClientQuery>,
         hash: &NaiveHash,
-    ) -> (Vec<RLWECiphertext>, Duration) {
+    ) -> (Vec<GlweCiphertext<AlignedScalarContainer>>, Duration) {
         assert_eq!(queries.len(), self.rows());
         let buf = FftBufferPool::new(rayon::max_num_threads(), &self.ctx);
+
         // first phase we execute the single query procedure and produce the output
         let start = Instant::now();
-        let (ys, ls): (Vec<RLWECiphertext>, Vec<Vec<RGSWCiphertext>>) = queries
+        let (ys, ls): (
+            Vec<GlweCiphertext<AlignedScalarContainer>>,
+            Vec<Vec<FourierGgswCiphertext<ComplexBox>>>,
+        ) = queries
             .par_iter()
             .zip(0..self.rows())
             .map(|(query, row)| {
@@ -562,11 +698,15 @@ impl Server {
             .zip(&queries)
             .zip(0..self.rows())
             .for_each(|((l, query), row)| {
-                update_db_st(query, self.data[row].clone(), &l, &buf, &self.ctx);
+                update_db_st(query, self.data[row].clone(), l, &buf, &self.ctx);
             });
 
         // then we iterate over all indices and perform consistency correction
-        let rw_flags: Vec<RGSWCiphertext> = queries.into_iter().map(|q| q.into_rw_flag()).collect();
+        let mut flag_buf = self.ctx.gen_fft_ctx();
+        let rw_flags: Vec<FourierGgswCiphertext<ComplexBox>> = queries
+            .into_iter()
+            .map(|q| q.into_rw_flag(&self.ctx, &mut flag_buf))
+            .collect();
         let item_count = self.rows() * self.cols() / hash.h_count();
         (0..item_count).into_par_iter().for_each(|i| {
             let positions: Vec<(usize, usize)> = (0..hash.h_count())
@@ -584,7 +724,7 @@ impl Server {
     /// Decrypt the database and turn the items into u64.
     /// Note that the conversion is lossy if one PlaintestList is larger
     /// than 64 bits, which it usually is.
-    pub fn decrypt_db(&self, sk: &RLWESecretKey) -> Vec<Vec<u64>> {
+    pub fn decrypt_db(&self, sk: &GlweSecretKey<AlignedScalarContainer>) -> Vec<Vec<u64>> {
         self.data
             .iter()
             .map(|row| {
@@ -594,7 +734,9 @@ impl Server {
                     .iter()
                     .map(|v| {
                         let mut pt = self.ctx.gen_zero_pt();
-                        sk.decrypt_decode_rlwe(&mut pt, v, &self.ctx);
+                        decrypt_glwe_ciphertext(&sk, &v, &mut pt);
+                        self.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
+
                         pt_to_lossy_u64(&pt)
                     })
                     .collect::<Vec<u64>>()
@@ -609,11 +751,18 @@ pub fn setup_random_oram(
     cols: usize,
     hash: &NaiveHash,
     params: TFHEParameters,
-) -> (Client, Server, Vec<PlaintextList<Vec<Scalar>>>) {
+) -> (Client, Server, Vec<PlaintextList<ScalarContainer>>) {
     assert_eq!(rows * cols, hash.input_domain() * hash.h_count());
     // rows = 1, cols = n if we're not batching
     let mut client = Client::new(rows, cols, params.clone());
-    let neg_sk_ct = client.gen_neg_sk();
+
+    let mut buf = client.ctx.gen_fft_ctx();
+    // Generate the -s keyswitching key.
+    let neg_sk_ct = convert_standard_ggsw_to_fourier(
+        neg_gsw_std(&client.sk, &mut client.ctx),
+        &client.ctx,
+        &mut buf,
+    );
 
     let (plain, data) = client.gen_dummy_database(hash);
     let server = Server::new(data, neg_sk_ct, params);
@@ -625,29 +774,43 @@ pub fn setup_random_oram(
 // (b_j * c_i1 * v_i1) + (b_j * c_i2 * v_i2) + (b_j * c_i3 * v_i3)
 fn correct_consistency(
     positions: &[(usize, usize)],
-    data: &[Arc<RwLock<Vec<RLWECiphertext>>>],
-    ls: &[Vec<RGSWCiphertext>],
-    rw_flags: &[RGSWCiphertext],
-    ctx: &Context,
+    data: &[Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>],
+    ls: &[Vec<FourierGgswCiphertext<ComplexBox>>],
+    rw_flags: &[FourierGgswCiphertext<ComplexBox>],
+    ctx: &Context<Scalar>,
     buf: &FftBufferPool,
-) -> RLWECiphertext {
+) -> GlweCiphertext<AlignedScalarContainer> {
     let tid = rayon::current_thread_index().unwrap();
     let first_r = positions[0].0;
     let first_c = positions[0].1;
-    let v1s: Vec<RLWECiphertext> = positions
+    let v1s: Vec<GlweCiphertext<AlignedScalarContainer>> = positions
         .iter()
         .map(|(r, c)| {
-            let mut tmp = RLWECiphertext::allocate(ctx.poly_size);
-            let mut out = RLWECiphertext::allocate(ctx.poly_size);
-            rw_flags[*r].external_product_with_buf(
-                &mut tmp,
-                &data[first_r].clone().read().unwrap()[first_c],
-                &mut buf.pool[tid].clone().lock().unwrap(),
+            let mut tmp = GlweCiphertext::from_container(
+                avec![Scalar::zero(); ctx.poly_size.0 * 2],
+                ctx.poly_size,
+                ctx.ciphertext_modulus,
             );
-            ls[*r][*c].external_product_with_buf(
+            let mut out = GlweCiphertext::from_container(
+                avec![Scalar::zero(); ctx.poly_size.0 * 2],
+                ctx.poly_size,
+                ctx.ciphertext_modulus,
+            );
+
+            add_external_product_assign_mem_optimized(
+                &mut tmp,
+                &rw_flags[*r],
+                &data[first_r].clone().read().unwrap()[first_c],
+                ctx.fft.as_view(),
+                buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
+            );
+
+            add_external_product_assign_mem_optimized(
                 &mut out,
+                &ls[*r][*c],
                 &tmp,
-                &mut buf.pool[tid].clone().lock().unwrap(),
+                ctx.fft.as_view(),
+                buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
             );
             out
         })
@@ -656,40 +819,56 @@ fn correct_consistency(
     // compute (1 - (b_j * c_i1 + b_j * c_i2 + b_j * c_i3 + ...)) * v_i1
     let mut first_term = data[first_r].clone().read().unwrap()[first_c].clone();
     for vs in &v1s {
-        first_term.update_with_sub(vs);
+        glwe_ciphertext_sub_assign(&mut first_term, vs);
     }
 
     // compute the remaining terms
     // (b_j * c_i1 * v_i1) + (b_j * c_i2 * v_i2) + (b_j * c_i3 * v_i3) + ...
     let second_terms = positions.iter().skip(1).map(|(r, c)| {
-        let mut tmp = RLWECiphertext::allocate(ctx.poly_size);
-        let mut out = RLWECiphertext::allocate(ctx.poly_size);
-        rw_flags[*r].external_product_with_buf(
+        let mut tmp = GlweCiphertext::from_container(
+            avec![Scalar::zero(); ctx.poly_size.0 * 2],
+            ctx.poly_size,
+            ctx.ciphertext_modulus,
+        );
+        let mut out = GlweCiphertext::from_container(
+            avec![Scalar::zero(); ctx.poly_size.0 * 2],
+            ctx.poly_size,
+            ctx.ciphertext_modulus,
+        );
+
+        add_external_product_assign_mem_optimized(
             &mut tmp,
+            &rw_flags[*r],
             &data[*r].clone().read().unwrap()[*c],
-            &mut buf.pool[tid].clone().lock().unwrap(),
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
-        ls[*r][*c].external_product_with_buf(
+
+        add_external_product_assign_mem_optimized(
             &mut out,
+            &ls[*r][*c],
             &tmp,
-            &mut buf.pool[tid].clone().lock().unwrap(),
+            ctx.fft.as_view(),
+            buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
+
         out
     });
 
     let mut second_term = v1s[0].clone();
     for term in second_terms {
-        second_term.update_with_add(&term);
+        glwe_ciphertext_add_assign(&mut second_term, &term);
     }
 
-    second_term.update_with_add(&first_term);
+    glwe_ciphertext_add_assign(&mut second_term, &first_term);
+
     second_term
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::rlwe::compute_noise_encoded;
+    use crate::utils::compute_noise_encoded;
 
     #[test]
     fn test_oram() {
@@ -705,7 +884,9 @@ mod test {
             let query = client.gen_read_query_one(idx, &hash);
             let y = server.process_one(query).0;
             let mut pt = client.ctx.gen_zero_pt();
-            client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
+
+            decrypt_glwe_ciphertext(&client.sk, &y, &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
 
             assert_eq!(pts[idx], pt);
 
@@ -720,13 +901,14 @@ mod test {
             // write
             let idx = 1usize;
             let new_data = client.ctx.gen_binary_pt();
-            let write_query = client.gen_write_query_one(idx, &new_data, &hash);
+            let write_query = client.gen_write_query_one(idx, new_data.clone(), &hash);
             server.process_one(write_query);
 
             let read_query = client.gen_read_query_one(idx, &hash);
             let y = server.process_one(read_query).0;
             let mut pt = client.ctx.gen_zero_pt();
-            client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
+            decrypt_glwe_ciphertext(&client.sk, &y, &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
 
             assert_eq!(new_data, pt);
         }
@@ -747,7 +929,8 @@ mod test {
             let query = client.gen_read_query_one(idx, &hash);
             let y = server.process_one(query).0;
             let mut pt = client.ctx.gen_zero_pt();
-            client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
+            decrypt_glwe_ciphertext(&client.sk, &y, &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
 
             assert_eq!(pts[idx], pt);
 
@@ -780,7 +963,8 @@ mod test {
 
             {
                 let mut pt = client.ctx.gen_zero_pt();
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[0], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[0], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(pts[idx1], pt);
                 // check noise
                 println!(
@@ -791,7 +975,8 @@ mod test {
 
             {
                 let mut pt = client.ctx.gen_zero_pt();
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[1], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[1], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(pts[idx2], pt);
             }
         }
@@ -802,8 +987,8 @@ mod test {
             let idx2 = 2usize;
             let new_data = client.ctx.gen_binary_pt();
             let write_queries = vec![
-                client.gen_write_query_one(idx1, &new_data, &hash),
-                client.gen_write_query_one(idx2, &new_data, &hash),
+                client.gen_write_query_one(idx1, new_data.clone(), &hash),
+                client.gen_write_query_one(idx2, new_data.clone(), &hash),
             ];
             server.process_multi(write_queries);
 
@@ -815,7 +1000,8 @@ mod test {
 
             {
                 let mut pt = client.ctx.gen_zero_pt();
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[0], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[0], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(new_data, pt);
                 // check noise
                 println!(
@@ -826,7 +1012,8 @@ mod test {
 
             {
                 let mut pt = client.ctx.gen_zero_pt();
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[1], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[1], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(new_data, pt);
             }
         }
@@ -853,7 +1040,8 @@ mod test {
             let mut pt = client.ctx.gen_zero_pt();
             let mut noise_checked = false;
             for (r, (_, i)) in mapping {
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[r], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(pts[indices[i]], pt);
 
                 // check noise
@@ -872,14 +1060,15 @@ mod test {
             let indices = vec![1usize, 2usize];
             let mapping = hash.hash_to_mapping(&indices, cols);
             let new_data = client.ctx.gen_binary_pt();
-            let write_query = client.gen_write_query_batch(&indices, &new_data, &hash);
+            let write_query = client.gen_write_query_batch(&indices, new_data.clone(), &hash);
             server.process_batch(write_query, &hash);
 
             let read_query = client.gen_read_query_batch(&indices, &hash);
             let ys = server.process_batch(read_query, &hash).0;
             let mut pt = client.ctx.gen_zero_pt();
             for (r, _) in mapping {
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[r], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(new_data, pt);
             }
 
@@ -887,11 +1076,14 @@ mod test {
             for i in indices {
                 for h in 0..h_count {
                     let (r, c) = hash.hash_to_tuple(h, i, cols);
-                    client.sk.decrypt_decode_rlwe(
-                        &mut pt,
+
+                    decrypt_glwe_ciphertext(
+                        &client.sk,
                         &server.data[r].clone().read().unwrap()[c],
-                        &client.ctx,
+                        &mut pt,
                     );
+                    client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
+
                     assert_eq!(new_data, pt);
                 }
             }
@@ -929,7 +1121,8 @@ mod test {
             let mut pt = client.ctx.gen_zero_pt();
             let mut noise_checked = false;
             for (r, (_, i)) in mapping {
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[r], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(pts[indices[i]], pt);
 
                 // check noise

@@ -74,9 +74,6 @@ pub struct Cli {
     #[clap(long, default_value_t = TFHEParameters::default().plaintext_modulus)]
     pub plaintext_modulus: u64,
 
-    #[clap(long, default_value_t = TFHEParameters::default().secure_seed)]
-    pub secure_seed: bool,
-
     #[clap(long, help = "print more information")]
     pub verbose: bool,
 

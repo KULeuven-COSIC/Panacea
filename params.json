@@ -60,8 +60,7 @@
         "key_switch_level_count": 11,
         "negs_base_log": 5,
         "negs_level_count": 11,
-        "plaintext_modulus": 256,
-        "secure_seed": true
+        "plaintext_modulus": 256
       }
     ]
   ]

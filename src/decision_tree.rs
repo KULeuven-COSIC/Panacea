@@ -1,13 +1,11 @@
 use bitvec::prelude::*;
-use concrete_core::{
-    commons::{
-        crypto::encoding::{Plaintext, PlaintextList},
-        math::tensor::{AsMutTensor, AsRefTensor},
-    },
-    prelude::{
-        DecompositionBaseLog, DecompositionLevelCount, DispersionParameter, LogStandardDev,
-        MonomialDegree, PolynomialSize,
-    },
+use dyn_stack::ReborrowMut;
+use tfhe::core_crypto::prelude::{
+    add_external_product_assign_mem_optimized, decrypt_glwe_ciphertext, encrypt_glwe_ciphertext,
+    glwe_ciphertext_add_assign, glwe_ciphertext_sub_assign, par_encrypt_constant_ggsw_ciphertext,
+    slice_algorithms::slice_wrapping_sub_assign, DecompositionBaseLog, DecompositionLevelCount,
+    DispersionParameter, FourierGgswCiphertext, GgswCiphertext, GlweCiphertext, GlweSecretKey,
+    LogStandardDev, Plaintext, PlaintextList, PolynomialSize,
 };
 
 use rayon::prelude::*;
@@ -21,12 +19,11 @@ use std::{
 
 use crate::{
     context::{Context, FftBuffer},
-    num_types::{One, Scalar, Zero},
+    num_types::{AlignedScalarContainer, ComplexBox, One, Scalar, ScalarContainer, Zero},
     params::TFHEParameters,
-    rgsw::RGSWCiphertext,
     rlwe::{
-        expand_fourier, gen_all_subs_ksk_fourier, FourierRLWEKeyswitchKey, RLWECiphertext,
-        RLWESecretKey,
+        convert_standard_ggsw_to_fourier, expand, gen_all_subs_ksk, less_eq_than, neg_gsw_std,
+        FourierRLWEKeyswitchKey,
     },
     utils::log2,
 };
@@ -109,11 +106,18 @@ impl Node {
     }
 
     /// Evaluate the decision tree with a feature vector and output the final class.
-    pub fn eval(&self, features: &Vec<usize>) -> usize {
+    pub fn eval(&self, features: &Vec<Scalar>) -> usize {
         let mut out = 0;
         eval_node(&mut out, self, features, 1);
         out
     }
+
+    // /// Evaluate the decision tree with a feature vector and output the sums of paths for each leaf
+    // pub fn eval_sum(&self, features: &Vec<usize>) -> Vec<GlweCiphertext<AlignedScalarContainer>> {
+    //     let mut out = 0;
+    //     eval_node(&mut out, self, features, 1);
+    //     out
+    // }
 
     /// Count the number of leaves.
     pub fn count_leaf(&self) -> usize {
@@ -205,7 +209,7 @@ impl Node {
 #[serde(rename_all = "lowercase")]
 /// An internal node in a decision tree.
 pub struct Internal {
-    pub threshold: usize,
+    pub threshold: Scalar,
     pub feature: usize,
     pub index: usize,
     pub op: Op,
@@ -244,7 +248,7 @@ fn flatten_tree(out: &mut Vec<Internal>, node: &Internal) {
     }
 }
 
-fn eval_node(out: &mut usize, node: &Node, features: &Vec<usize>, b: usize) {
+fn eval_node(out: &mut usize, node: &Node, features: &Vec<Scalar>, b: usize) {
     match node {
         Node::Leaf(x) => {
             *out += *x * b;
@@ -253,20 +257,20 @@ fn eval_node(out: &mut usize, node: &Node, features: &Vec<usize>, b: usize) {
             Op::LEQ => {
                 if features[node.feature] <= node.threshold {
                     match &node.left {
-                        Some(left) => eval_node(out, &left, features, b),
+                        Some(left) => eval_node(out, left, features, b),
                         None => (),
                     };
                     match &node.right {
-                        Some(right) => eval_node(out, &right, features, b * (1 - b)),
+                        Some(right) => eval_node(out, right, features, b * (1 - b)),
                         None => (),
                     };
                 } else {
                     match &node.left {
-                        Some(left) => eval_node(out, &left, features, b * (1 - b)),
+                        Some(left) => eval_node(out, left, features, b * (1 - b)),
                         None => (),
                     };
                     match &node.right {
-                        Some(right) => eval_node(out, &right, features, b),
+                        Some(right) => eval_node(out, right, features, b),
                         None => (),
                     };
                 }
@@ -329,25 +333,25 @@ pub fn trunc_tree(root: &Option<Node>) -> Option<Node> {
 /// and then output an iterator of (RGSW) encrypted choice bits.
 pub fn compare_expand<'a>(
     flat_nodes: &'a [Internal],
-    client_cts: &'a [Vec<RLWECiphertext>],
-    neg_sk_ct: &'a RGSWCiphertext,
+    client_cts: &'a [Vec<GlweCiphertext<AlignedScalarContainer>>],
+    neg_sk_ct: &'a FourierGgswCiphertext<ComplexBox>,
     ksk_map: &'a HashMap<usize, FourierRLWEKeyswitchKey>,
-    ctx: &'a Context,
-) -> impl Iterator<Item = RGSWCiphertext> + 'a {
-    flat_nodes.iter().map(|node| {
+    ctx: &'a Context<Scalar>,
+) -> impl Iterator<Item = FourierGgswCiphertext<ComplexBox>> + 'a {
+    let mut buf = ctx.gen_fft_ctx();
+    flat_nodes.iter().map(move |node| {
         let cts = client_cts[node.feature]
             .iter()
             .map(|c| {
-                let mut ct = RLWECiphertext::allocate(ctx.poly_size);
-                ct.fill_with_copy(c);
+                let mut ct = c.clone();
                 match node.op {
-                    Op::LEQ => ct.less_eq_than(node.threshold),
+                    Op::LEQ => less_eq_than(&mut ct, node.threshold),
                     Op::GT => todo!(),
                 }
                 ct
             })
             .collect();
-        expand_fourier(&cts, ksk_map, neg_sk_ct, ctx)
+        expand(&cts, ksk_map, neg_sk_ct, ctx, &mut buf)
     })
 }
 
@@ -359,28 +363,34 @@ pub enum EncNode {
 
 impl EncNode {
     /// Create a new root from  a plaintext root and encrypted choice bits.
-    pub fn new(clear_root: &Node, rgsw_cts: &mut impl Iterator<Item = RGSWCiphertext>) -> Self {
-        let ct = rgsw_cts.next().unwrap();
+    pub fn new(
+        clear_root: &Node,
+        cts: &mut impl Iterator<Item = FourierGgswCiphertext<ComplexBox>>,
+    ) -> Self {
+        let ct = cts.next().unwrap();
         let mut out = EncInternal {
             ct,
             left: Some(Self::Leaf(0)),
             right: Some(Self::Leaf(0)),
         };
         match clear_root {
-            Node::Internal(inner) => new_enc_node(&mut out, inner, rgsw_cts),
+            Node::Internal(inner) => new_enc_node(&mut out, inner, cts),
             Node::Leaf(_) => panic!("this is a leaf"),
         }
         Self::Internal(Box::new(out))
     }
 
     /// Evaluate the tree.
-    pub fn eval(&self, ctx: &Context, buf: &mut FftBuffer) -> Vec<RLWECiphertext> {
+    pub fn eval(
+        &self,
+        ctx: &Context<Scalar>,
+        buf: &mut FftBuffer,
+    ) -> Vec<GlweCiphertext<AlignedScalarContainer>> {
         let max_leaf_bits = ((self.max_leaf() + 1) as f64).log2().ceil() as usize;
-        let mut out = vec![RLWECiphertext::allocate(ctx.poly_size); max_leaf_bits];
-        let mut c = RLWECiphertext::allocate(ctx.poly_size);
-        *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one();
-        ctx.codec
-            .encode(c.get_mut_body().as_mut_tensor().first_mut());
+        let mut out = vec![ctx.empty_glwe_ciphertext(); max_leaf_bits];
+        let mut c = ctx.empty_glwe_ciphertext();
+        (*c.get_mut_body().as_mut())[0] = Scalar::one();
+        ctx.codec.encode(&mut (c.get_mut_body().as_mut())[0]);
         eval_enc_node(&mut out, self, c, ctx, buf);
         out
     }
@@ -389,15 +399,9 @@ impl EncNode {
     pub fn max_leaf(&self) -> usize {
         match self {
             Self::Internal(internal) => {
-                let l = match &internal.left {
-                    Some(left) => Some(left.max_leaf()),
-                    None => None,
-                };
+                let l = internal.left.as_ref().map(|left| left.max_leaf());
 
-                let r = match &internal.right {
-                    Some(right) => Some(right.max_leaf()),
-                    None => None,
-                };
+                let r = internal.right.as_ref().map(|right| right.max_leaf());
 
                 match (l, r) {
                     (Some(left), Some(right)) => max(left, right),
@@ -413,7 +417,7 @@ impl EncNode {
 
 /// An encrypted internal node where the ciphertext is the choice bit.
 pub struct EncInternal {
-    pub ct: RGSWCiphertext,
+    pub ct: FourierGgswCiphertext<ComplexBox>,
     pub left: Option<EncNode>,
     pub right: Option<EncNode>,
 }
@@ -421,7 +425,7 @@ pub struct EncInternal {
 fn new_enc_node(
     enc_node: &mut EncInternal,
     clear_node: &Internal,
-    rgsw_cts: &mut impl Iterator<Item = RGSWCiphertext>,
+    rgsw_cts: &mut impl Iterator<Item = FourierGgswCiphertext<ComplexBox>>,
 ) {
     match &clear_node.left {
         Some(Node::Leaf(x)) => enc_node.left = Some(EncNode::Leaf(*x)),
@@ -458,32 +462,42 @@ fn new_enc_node(
 }
 
 fn eval_enc_node(
-    out: &mut Vec<RLWECiphertext>,
+    out: &mut Vec<GlweCiphertext<AlignedScalarContainer>>,
     node: &EncNode,
-    b: RLWECiphertext,
-    ctx: &Context,
+    mut b: GlweCiphertext<AlignedScalarContainer>,
+    ctx: &Context<Scalar>,
     buf: &mut FftBuffer,
 ) {
     match node {
         EncNode::Leaf(x) => {
             for (bit, ct) in (*x).view_bits::<Lsb0>().iter().zip(out.iter_mut()) {
                 if *bit {
-                    ct.update_with_add(&b);
+                    glwe_ciphertext_add_assign(ct, &b);
                 }
             }
         }
         EncNode::Internal(node) => {
-            let mut left = RLWECiphertext::allocate(ctx.poly_size);
-            node.ct.external_product_with_buf(&mut left, &b, buf);
-            let mut right = b;
-            right.update_with_sub(&left);
+            let mut left = ctx.empty_glwe_ciphertext();
+            // let mut stack = buf.mem.stack();
+            add_external_product_assign_mem_optimized(
+                &mut left,
+                &node.ct,
+                &b,
+                buf.fft.as_view(),
+                buf.mem.stack().rb_mut(),
+            );
+            // node.ct.external_product_with_buf(&mut left, &b, buf);
 
-            match &node.left {
-                Some(left_child) => eval_enc_node(out, &left_child, left, ctx, buf),
+            match &node.right {
+                Some(right_child) => {
+                    slice_wrapping_sub_assign(b.as_mut(), left.as_ref());
+
+                    eval_enc_node(out, right_child, b, ctx, buf);
+                }
                 None => (),
             }
-            match &node.right {
-                Some(right_child) => eval_enc_node(out, &right_child, right, ctx, buf),
+            match &node.left {
+                Some(left_child) => eval_enc_node(out, left_child, left, ctx, buf),
                 None => (),
             }
         }
@@ -494,42 +508,49 @@ fn eval_enc_node(
 /// (representing an integer i) into a vector of length 2^n,
 /// where the ith vector is `b`.
 pub fn demux_with(
-    b: RLWECiphertext,
-    bits: &Vec<RGSWCiphertext>,
-    ctx: &Context,
+    b: GlweCiphertext<AlignedScalarContainer>,
+    bits: &Vec<FourierGgswCiphertext<ComplexBox>>,
+    ctx: &Context<Scalar>,
     buf: &mut FftBuffer,
-) -> Vec<RLWECiphertext> {
+) -> Vec<GlweCiphertext<AlignedScalarContainer>> {
     demux_rec(0, b, bits, ctx, buf)
 }
 
 /// Demultiplex a length n vector of RGSW ciphertexts into
 /// a unit vector of length 2^n.
 pub fn demux(
-    bits: &Vec<RGSWCiphertext>,
-    ctx: &Context,
+    bits: &Vec<FourierGgswCiphertext<ComplexBox>>,
+    ctx: &Context<Scalar>,
     buf: &mut FftBuffer,
-) -> Vec<RLWECiphertext> {
+) -> Vec<GlweCiphertext<AlignedScalarContainer>> {
     // NOTE: no need to encrypt here since the "server" generates this ciphertext
-    let mut c = RLWECiphertext::allocate(ctx.poly_size);
-    *c.get_mut_body().as_mut_tensor().first_mut() = Scalar::one();
-    ctx.codec
-        .encode(c.get_mut_body().as_mut_tensor().first_mut());
+    let mut c = ctx.empty_glwe_ciphertext();
+    (*c.get_mut_body().as_mut())[0] = Scalar::one();
+    ctx.codec.encode(&mut (c.get_mut_body().as_mut())[0]);
 
     demux_with(c, bits, ctx, buf)
 }
 
 fn demux_rec(
     level: usize,
-    b: RLWECiphertext,
-    bits: &Vec<RGSWCiphertext>,
-    ctx: &Context,
+    b: GlweCiphertext<AlignedScalarContainer>,
+    bits: &Vec<FourierGgswCiphertext<ComplexBox>>,
+    ctx: &Context<Scalar>,
     buf: &mut FftBuffer,
-) -> Vec<RLWECiphertext> {
+) -> Vec<GlweCiphertext<AlignedScalarContainer>> {
     assert!(level < bits.len());
-    let mut left = RLWECiphertext::allocate(ctx.poly_size);
-    bits[level].external_product_with_buf(&mut left, &b, buf);
+    let mut left = ctx.empty_glwe_ciphertext();
+
+    add_external_product_assign_mem_optimized(
+        &mut left,
+        &bits[level],
+        &b,
+        ctx.fft.as_view(),
+        buf.mem.stack().rb_mut(),
+    );
+
     let mut right = b;
-    right.update_with_sub(&left);
+    glwe_ciphertext_sub_assign(&mut right, &left);
     if level + 1 == bits.len() {
         // base case:
         vec![left, right]
@@ -545,25 +566,26 @@ fn demux_rec(
 
 /// Every feature v is encrypted as RLWE(1/(B^j n) X^v) for j in 1...\ell
 pub fn encrypt_feature_vector(
-    sk: &RLWESecretKey,
-    vs: &Vec<usize>,
-    ctx: &mut Context,
-) -> Vec<Vec<RLWECiphertext>> {
-    let mut pt = PlaintextList::allocate(Scalar::zero(), ctx.plaintext_count());
-    let logn = log2(ctx.poly_size.0);
+    sk: &GlweSecretKey<ScalarContainer>,
+    vs: &Vec<Scalar>,
+    ctx: &mut Context<Scalar>,
+) -> Vec<Vec<GlweCiphertext<AlignedScalarContainer>>> {
+    let mut pt = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+    let logn = log2(ctx.poly_size.0) as Scalar;
     let mut out = Vec::new(); // TODO preallocate
     for v in vs {
         let mut tmp = Vec::new();
-        for level in 1..=ctx.level_count.0 {
-            assert!(*v < ctx.poly_size.0);
-            let shift: usize = (Scalar::BITS as usize) - ctx.base_log.0 * level - logn;
-            pt.as_mut_tensor().fill_with_element(Scalar::zero());
-            *pt.as_mut_polynomial()
-                .get_mut_monomial(MonomialDegree(*v))
-                .get_mut_coefficient() = Scalar::one() << shift;
+        for level in 1..=ctx.level_count.0 as Scalar {
+            assert!(*v < ctx.poly_size.0 as Scalar);
+            let shift: Scalar =
+                (Scalar::BITS) as Scalar - (ctx.base_log.0 as Scalar) * level - logn;
+            pt.as_mut().par_iter_mut().for_each(|x| *x = Scalar::zero());
+            (*pt.as_mut())[*v as usize] = Scalar::one() << shift;
 
-            let mut ct = RLWECiphertext::allocate(ctx.poly_size);
-            sk.encrypt_rlwe(&mut ct, &pt, ctx.std, &mut ctx.encryption_generator);
+            let mut ct = ctx.empty_glwe_ciphertext();
+            //todo consider assign or list
+            encrypt_glwe_ciphertext(sk, &mut ct, &pt, ctx.std, &mut ctx.encryption_generator);
+
             tmp.push(ct);
         }
         out.push(tmp);
@@ -575,7 +597,7 @@ pub struct SimulationResult {
     pub input_count: usize,
     pub setup_duration: Duration,
     pub server_duration: Duration,
-    pub predictions: Vec<Scalar>,
+    pub predictions: ScalarContainer,
     pub std: LogStandardDev,
     pub poly_size: PolynomialSize,
     pub base_log: DecompositionBaseLog,
@@ -591,8 +613,8 @@ impl SimulationResult {
         input_count: usize,
         setup_duration: Duration,
         server_duration: Duration,
-        predictions: Vec<Scalar>,
-        ctx: &Context,
+        predictions: ScalarContainer,
+        ctx: &Context<Scalar>,
     ) -> Self {
         Self {
             input_count,
@@ -621,12 +643,17 @@ impl Display for SimulationResult {
     }
 }
 
-fn decrypt_and_recompose(sk: &RLWESecretKey, cts: &Vec<RLWECiphertext>, ctx: &Context) -> Scalar {
+fn decrypt_and_recompose(
+    sk: &GlweSecretKey<ScalarContainer>,
+    cts: &Vec<GlweCiphertext<AlignedScalarContainer>>,
+    ctx: &Context<Scalar>,
+) -> Scalar {
     let mut bv: BitVec<Scalar, Lsb0> = BitVec::new();
-    let mut pt = PlaintextList::allocate(Scalar::zero(), ctx.plaintext_count());
+    let mut pt = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
     for ct in cts {
-        sk.decrypt_decode_rlwe(&mut pt, ct, ctx);
-        match pt.as_tensor().first() {
+        decrypt_glwe_ciphertext(sk, ct, &mut pt);
+        ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
+        match pt.as_ref()[0] {
             0 => bv.push(false),
             1 => bv.push(true),
             _ => panic!("expected binary plaintext"),
@@ -640,15 +667,20 @@ fn decrypt_and_recompose(sk: &RLWESecretKey, cts: &Vec<RLWECiphertext>, ctx: &Co
 /// See the rayon documentation for how to control the number of threads.
 /// Finally, return a `SimulationResult` which mainly consists of the timing
 /// information and the evaluation result.
-pub fn simulate(model: &Node, features: &Vec<Vec<usize>>, parallel: bool) -> SimulationResult {
+pub fn simulate(model: &Node, features: &[Vec<Scalar>], parallel: bool) -> SimulationResult {
     // Client side
     let setup_instant = Instant::now();
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
-    let neg_sk_ct = sk.neg_gsw(&mut ctx);
-    // let mut buffers = ctx.gen_fourier_buffers();
-    let ksk_map = gen_all_subs_ksk_fourier(&sk, &mut ctx);
-    let client_cts: Vec<Vec<Vec<RLWECiphertext>>> = features
+    let mut buf = ctx.gen_fft_ctx();
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+
+    let neg_sk_ct = convert_standard_ggsw_to_fourier(neg_gsw_std(&sk, &mut ctx), &ctx, &mut buf);
+    let ksk_map = gen_all_subs_ksk(&sk, &mut ctx);
+    let client_cts: Vec<Vec<Vec<GlweCiphertext<AlignedScalarContainer>>>> = features
         .iter()
         .map(|f| encrypt_feature_vector(&sk, f, &mut ctx))
         .collect();
@@ -662,12 +694,11 @@ pub fn simulate(model: &Node, features: &Vec<Vec<usize>>, parallel: bool) -> Sim
             EncNode::new(model, &mut rgsw_cts)
         };
         // NOTE: we need to create new buffers for every operation since it's not thread safe
-        // let mut buffers = ctx.gen_fourier_buffers();
         let mut buf = FftBuffer::new(ctx.poly_size);
         enc_root.eval(&ctx, &mut buf)
     };
     let server_instant = Instant::now();
-    let output_cts: Vec<Vec<RLWECiphertext>> = if parallel {
+    let output_cts: Vec<Vec<GlweCiphertext<AlignedScalarContainer>>> = if parallel {
         client_cts.par_iter().map(|ct| server_f(ct)).collect()
     } else {
         client_cts.iter().map(|ct| server_f(ct)).collect()
@@ -698,29 +729,49 @@ pub fn simulate(model: &Node, features: &Vec<Vec<usize>>, parallel: bool) -> Sim
 pub fn bit_decomposed_rgsw(
     i: usize,
     n: usize,
-    sk: &RLWESecretKey,
-    ctx: &mut Context,
-) -> Vec<RGSWCiphertext> {
+    sk: &GlweSecretKey<ScalarContainer>,
+    ctx: &mut Context<Scalar>,
+) -> Vec<GgswCiphertext<ScalarContainer>> {
     let mut i_bits = i.view_bits::<Lsb0>()[..log2(n)].to_bitvec();
     assert!(i_bits.len() <= log2(n));
     i_bits.reverse();
 
-    let mut a: Vec<RGSWCiphertext> =
-        vec![RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count); i_bits.len()];
+    let mut a: Vec<GgswCiphertext<ScalarContainer>> = vec![
+        GgswCiphertext::new(
+            Scalar::zero(),
+            ctx.glwe_size,
+            ctx.poly_size,
+            ctx.base_log,
+            ctx.level_count,
+            ctx.ciphertext_modulus,
+        );
+        i_bits.len()
+    ];
 
-    let one = Plaintext(Scalar::one());
-    let zero = Plaintext(Scalar::zero());
     for i in 0..a.len() {
-        sk.encrypt_constant_rgsw(&mut a[i], if i_bits[i] { &zero } else { &one }, ctx);
+        par_encrypt_constant_ggsw_ciphertext(
+            sk,
+            &mut a[i],
+            if i_bits[i] {
+                Plaintext(Scalar::zero())
+            } else {
+                Plaintext(Scalar::one())
+            },
+            ctx.std,
+            &mut ctx.encryption_generator,
+        )
     }
     a
 }
 
 #[cfg(test)]
 mod test {
-    use concrete_core::commons::crypto::encoding::Plaintext;
+    use tfhe::core_crypto::prelude::{
+        convert_standard_ggsw_ciphertext_to_fourier_mem_optimized,
+        par_encrypt_constant_ggsw_ciphertext, Plaintext,
+    };
 
-    use crate::{params::TFHEParameters, rlwe::compute_noise_encoded};
+    use crate::{params::TFHEParameters, utils::compute_noise_encoded};
 
     use super::*;
 
@@ -874,7 +925,7 @@ mod test {
 
     #[test]
     fn test_traversal_long() {
-        const TH: usize = 10;
+        const TH: Scalar = 10;
         const D: usize = 10;
         fn gen_line(d: usize) -> Node {
             if d == 0 {
@@ -896,12 +947,12 @@ mod test {
             out
         };
         {
-            let features = vec![1usize];
+            let features = vec![1];
             assert_eq!(1, root.eval(&features));
             simulate(&root, &vec![features], false);
         }
         {
-            let features = vec![11usize];
+            let features = vec![11];
             assert_eq!(0, root.eval(&features));
             simulate(&root, &vec![features], false);
         }
@@ -939,31 +990,83 @@ mod test {
     fn test_demux() {
         let mut ctx = Context::new(TFHEParameters::default());
         let mut buf = ctx.gen_fft_ctx();
-        let sk = RLWESecretKey::generate_binary(ctx.poly_size, &mut ctx.secret_generator);
+        let sk = GlweSecretKey::generate_new_binary(
+            ctx.glwe_dimension,
+            ctx.poly_size,
+            &mut ctx.secret_generator,
+        );
+        let pt_zero = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+        let mut pt_unit = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+        (*pt_unit.as_mut())[0] = Scalar::one();
+
+        let mut pt0 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+        let mut pt1 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+        let mut pt2 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+        let mut pt3 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
 
         {
             // test 11
+
             let mut bits = vec![
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count),
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count),
+                FourierGgswCiphertext::new(
+                    ctx.glwe_size,
+                    ctx.poly_size,
+                    ctx.base_log,
+                    ctx.level_count
+                );
+                2
             ];
-            sk.encrypt_constant_rgsw(&mut bits[0], &Plaintext(Scalar::one()), &mut ctx);
-            sk.encrypt_constant_rgsw(&mut bits[1], &Plaintext(Scalar::one()), &mut ctx);
+
+            let mut tmp = GgswCiphertext::new(
+                Scalar::zero(),
+                ctx.glwe_size,
+                ctx.poly_size,
+                ctx.base_log,
+                ctx.level_count,
+                ctx.ciphertext_modulus,
+            );
+            par_encrypt_constant_ggsw_ciphertext(
+                &sk,
+                &mut tmp,
+                Plaintext(Scalar::one()),
+                ctx.std,
+                &mut ctx.encryption_generator,
+            );
+
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+                &tmp,
+                &mut bits[0],
+                ctx.fft.as_view(),
+                buf.mem.stack().rb_mut(),
+            );
+
+            par_encrypt_constant_ggsw_ciphertext(
+                &sk,
+                &mut tmp,
+                Plaintext(Scalar::one()),
+                ctx.std,
+                &mut ctx.encryption_generator,
+            );
+
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+                &tmp,
+                &mut bits[1],
+                ctx.fft.as_view(),
+                buf.mem.stack().rb_mut(),
+            );
+
             let cts = demux(&bits, &ctx, &mut buf);
 
             assert_eq!(cts.len(), 4);
 
-            let mut pt0 = ctx.gen_zero_pt();
-            let mut pt1 = ctx.gen_zero_pt();
-            let mut pt2 = ctx.gen_zero_pt();
-            let mut pt3 = ctx.gen_zero_pt();
-            sk.decrypt_decode_rlwe(&mut pt0, &cts[0], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt1, &cts[1], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt2, &cts[2], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt3, &cts[3], &ctx);
-
-            let pt_zero = ctx.gen_zero_pt();
-            let pt_unit = ctx.gen_unit_pt();
+            decrypt_glwe_ciphertext(&sk, &cts[0], &mut pt0);
+            ctx.codec.poly_decode(&mut pt0.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[1], &mut pt1);
+            ctx.codec.poly_decode(&mut pt1.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[2], &mut pt2);
+            ctx.codec.poly_decode(&mut pt2.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[3], &mut pt3);
+            ctx.codec.poly_decode(&mut pt3.as_mut_polynomial());
 
             assert_eq!(pt0, pt_unit);
             assert_eq!(pt1, pt_zero);
@@ -979,27 +1082,67 @@ mod test {
 
         {
             // test 00
+
             let mut bits = vec![
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count),
-                RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count),
+                FourierGgswCiphertext::new(
+                    ctx.glwe_size,
+                    ctx.poly_size,
+                    ctx.base_log,
+                    ctx.level_count
+                );
+                2
             ];
-            sk.encrypt_constant_rgsw(&mut bits[0], &Plaintext(Scalar::zero()), &mut ctx);
-            sk.encrypt_constant_rgsw(&mut bits[1], &Plaintext(Scalar::zero()), &mut ctx);
+
+            let mut tmp = GgswCiphertext::new(
+                Scalar::zero(),
+                ctx.glwe_size,
+                ctx.poly_size,
+                ctx.base_log,
+                ctx.level_count,
+                ctx.ciphertext_modulus,
+            );
+            par_encrypt_constant_ggsw_ciphertext(
+                &sk,
+                &mut tmp,
+                Plaintext(Scalar::zero()),
+                ctx.std,
+                &mut ctx.encryption_generator,
+            );
+
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+                &tmp,
+                &mut bits[0],
+                ctx.fft.as_view(),
+                buf.mem.stack().rb_mut(),
+            );
+
+            par_encrypt_constant_ggsw_ciphertext(
+                &sk,
+                &mut tmp,
+                Plaintext(Scalar::zero()),
+                ctx.std,
+                &mut ctx.encryption_generator,
+            );
+
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+                &tmp,
+                &mut bits[1],
+                ctx.fft.as_view(),
+                buf.mem.stack().rb_mut(),
+            );
+
             let cts = demux(&bits, &ctx, &mut buf);
 
             assert_eq!(cts.len(), 4);
 
-            let mut pt0 = ctx.gen_zero_pt();
-            let mut pt1 = ctx.gen_zero_pt();
-            let mut pt2 = ctx.gen_zero_pt();
-            let mut pt3 = ctx.gen_zero_pt();
-            sk.decrypt_decode_rlwe(&mut pt0, &cts[0], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt1, &cts[1], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt2, &cts[2], &ctx);
-            sk.decrypt_decode_rlwe(&mut pt3, &cts[3], &ctx);
-
-            let pt_zero = ctx.gen_zero_pt();
-            let pt_unit = ctx.gen_unit_pt();
+            decrypt_glwe_ciphertext(&sk, &cts[0], &mut pt0);
+            ctx.codec.poly_decode(&mut pt0.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[1], &mut pt1);
+            ctx.codec.poly_decode(&mut pt1.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[2], &mut pt2);
+            ctx.codec.poly_decode(&mut pt2.as_mut_polynomial());
+            decrypt_glwe_ciphertext(&sk, &cts[3], &mut pt3);
+            ctx.codec.poly_decode(&mut pt3.as_mut_polynomial());
 
             assert_eq!(pt0, pt_zero);
             assert_eq!(pt1, pt_zero);
@@ -1018,12 +1161,20 @@ mod test {
     fn test_demux_long() {
         let mut ctx = Context::new(TFHEParameters::default());
         let mut buf = ctx.gen_fft_ctx();
-        let sk = RLWESecretKey::generate_binary(ctx.poly_size, &mut ctx.secret_generator);
+        let sk = GlweSecretKey::generate_new_binary(
+            ctx.glwe_dimension,
+            ctx.poly_size,
+            &mut ctx.secret_generator,
+        );
 
         let depth = 4usize;
 
         for i in 0..(1 << depth) {
-            let bits = bit_decomposed_rgsw(i, 1 << depth, &sk, &mut ctx);
+            let bits = bit_decomposed_rgsw(i, 1 << depth, &sk, &mut ctx)
+                .iter()
+                .map(|ct| convert_standard_ggsw_to_fourier(ct.clone(), &ctx, &mut buf))
+                .collect();
+
             let cts = demux(&bits, &ctx, &mut buf);
             assert_eq!(cts.len(), 1 << depth);
 
@@ -1031,8 +1182,10 @@ mod test {
             let pt_zero = ctx.gen_zero_pt();
 
             let mut pt = ctx.gen_zero_pt();
-            for j in 0..(1 << depth) {
-                sk.decrypt_decode_rlwe(&mut pt, &cts[j], &ctx);
+            for (j, ct) in cts.iter().enumerate().take(1 << depth) {
+                decrypt_glwe_ciphertext(&sk, &ct, &mut pt);
+                ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
+
                 if j == i {
                     assert_eq!(pt, pt_unit);
                 } else {

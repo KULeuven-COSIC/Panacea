@@ -1,10 +1,13 @@
-use concrete_core::backends::fft::private::c64;
+use aligned_vec::{ABox, AVec};
+use concrete_fft::c64;
 
 pub type Scalar = u64;
 pub type Complex = c64;
 pub type SignedScalar = i64;
 pub type ScalarContainer = Vec<Scalar>;
-pub type ComplexContaier = Vec<Complex>;
+pub type AlignedScalarContainer = AVec<Scalar>;
+pub type ComplexContainer = AVec<Complex>;
+pub type ComplexBox = ABox<[Complex]>;
 
 pub trait Zero<T> {
     fn zero() -> T;

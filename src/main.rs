@@ -4,10 +4,10 @@ use panacea::{
     naive_hash::NaiveHash,
     oram::setup_random_oram,
     params::{ORAMParameters, ServerParams, TFHEParameters},
-    rlwe::compute_noise_encoded,
-    utils::log2,
+    utils::{compute_noise_encoded, log2},
 };
 use std::{fs::File, io::BufReader, time::Instant};
+use tfhe::core_crypto::prelude::decrypt_glwe_ciphertext;
 
 fn single_query(item_count: usize, iterations: usize, tfhe_params: TFHEParameters, dryrun: bool) {
     assert!(iterations > 0);
@@ -29,7 +29,9 @@ fn single_query(item_count: usize, iterations: usize, tfhe_params: TFHEParameter
 
         // check for result
         let mut pt = client.ctx.gen_zero_pt();
-        client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
+
+        decrypt_glwe_ciphertext(&client.sk, &y, &mut pt);
+        client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
         assert_eq!(pts[idx], pt);
 
         // check the final noise
@@ -43,7 +45,9 @@ fn single_query(item_count: usize, iterations: usize, tfhe_params: TFHEParameter
             let query = client.gen_read_query_one(idx, &hash);
             let (y, _) = server.process_one(query);
             let mut pt = client.ctx.gen_zero_pt();
-            client.sk.decrypt_decode_rlwe(&mut pt, &y, &client.ctx);
+
+            decrypt_glwe_ciphertext(&client.sk, &y, &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
             assert_eq!(pts[idx], pt);
             let noise = compute_noise_encoded(&client.sk, &y, &pt, &client.ctx.codec);
             println!("### mode=0, iter={}, noise={}", iter, noise);
@@ -82,7 +86,8 @@ fn multi_query(
         let mut avg_noise = 0f64;
         let mut pt = client.ctx.gen_zero_pt();
         for i in 0..query_count {
-            client.sk.decrypt_decode_rlwe(&mut pt, &ys[i], &client.ctx);
+            decrypt_glwe_ciphertext(&client.sk, &ys[i], &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
             avg_noise += compute_noise_encoded(&client.sk, &ys[i], &pt, &client.ctx.codec);
             assert_eq!(pts[i + 1], pt);
         }
@@ -101,7 +106,8 @@ fn multi_query(
             let mut avg_noise = 0f64;
             let mut pt = client.ctx.gen_zero_pt();
             for i in 0..query_count {
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[i], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[i], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 avg_noise += compute_noise_encoded(&client.sk, &ys[i], &pt, &client.ctx.codec);
                 assert_eq!(pts[i + 1], pt);
             }
@@ -148,7 +154,8 @@ fn batch_query(
         let mut pt = client.ctx.gen_zero_pt();
         let mut avg_noise = 0f64;
         for (r, (_, i)) in mapping {
-            client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+            decrypt_glwe_ciphertext(&client.sk, &ys[r], &mut pt);
+            client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
             assert_eq!(pts[indices[i]], pt);
             let noise = compute_noise_encoded(&client.sk, &ys[r], &pt, &client.ctx.codec);
             avg_noise += noise;
@@ -163,7 +170,8 @@ fn batch_query(
             let mut pt = client.ctx.gen_zero_pt();
             let mut avg_noise = 0f64;
             for (r, (_, i)) in mapping {
-                client.sk.decrypt_decode_rlwe(&mut pt, &ys[r], &client.ctx);
+                decrypt_glwe_ciphertext(&client.sk, &ys[r], &mut pt);
+                client.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
                 assert_eq!(pts[indices[i]], pt);
                 let noise = compute_noise_encoded(&client.sk, &ys[r], &pt, &client.ctx.codec);
                 avg_noise += noise;
@@ -222,7 +230,6 @@ fn main() {
                 negs_base_log: cli.negs_base_log,
                 negs_level_count: cli.negs_level_count,
                 plaintext_modulus: cli.plaintext_modulus,
-                secure_seed: cli.secure_seed,
             },
         }],
     };
@@ -231,7 +238,7 @@ fn main() {
     );
     for params in input_params {
         print!(
-            "{},{},{},{},{},{},{},{},2^{},{},",
+            "{},{},{},{},{},{},{},{},2^{},",
             params.tfhe.standard_deviation,
             params.tfhe.polynomial_size,
             params.tfhe.base_log,
@@ -241,7 +248,6 @@ fn main() {
             params.tfhe.negs_base_log,
             params.tfhe.negs_level_count,
             log2(params.tfhe.plaintext_modulus as usize),
-            params.tfhe.secure_seed
         );
         match params.oram {
             ORAMParameters::SingleQuery {

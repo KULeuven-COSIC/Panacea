@@ -11,7 +11,6 @@ pub struct TFHEParameters {
     pub negs_base_log: usize,
     pub negs_level_count: usize,
     pub plaintext_modulus: u64,
-    pub secure_seed: bool,
 }
 
 impl Default for TFHEParameters {
@@ -26,7 +25,6 @@ impl Default for TFHEParameters {
             negs_base_log: 5,
             negs_level_count: 11,
             plaintext_modulus: 1 << 8,
-            secure_seed: true,
         }
     }
 }
@@ -76,19 +74,13 @@ impl Default for InputParamsList {
     }
 }
 
+#[derive(Default)]
 pub struct ServerParams {
     pub oram: ORAMParameters,
     pub tfhe: TFHEParameters,
 }
 
-impl Default for ServerParams {
-    fn default() -> Self {
-        Self {
-            oram: ORAMParameters::default(),
-            tfhe: TFHEParameters::default(),
-        }
-    }
-}
+
 
 impl ServerParams {
     pub fn from_input_params_list(input: InputParamsList) -> Vec<Self> {

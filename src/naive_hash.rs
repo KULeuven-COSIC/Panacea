@@ -1,6 +1,5 @@
 use rand::seq::SliceRandom;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 /// We just create a table for the digests
 /// An improvement would be tabluation hashing, see https://en.wikipedia.org/wiki/Tabulation_hashing
 #[derive(Clone, Debug)]

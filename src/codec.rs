@@ -1,9 +1,7 @@
-use concrete_core::{
-    commons::math::{decomposition::SignedDecomposer, polynomial::Polynomial, tensor::AsMutSlice},
-    prelude::{DecompositionBaseLog, DecompositionLevelCount},
-};
-
 use crate::{num_types::Scalar, utils::log2};
+use tfhe::core_crypto::prelude::{
+    DecompositionBaseLog, DecompositionLevelCount, Polynomial, SignedDecomposer,
+};
 
 pub struct Codec {
     decomposer: SignedDecomposer<Scalar>,
@@ -49,7 +47,7 @@ impl Codec {
     }
 
     /// Encode ternary x as x*(q/3)
-    pub fn ternary_encode(x: &mut Scalar) {
+    pub fn ternary_encode(&self, x: &mut Scalar) {
         const THIRD: Scalar = (Scalar::MAX as f64 / 3.0) as Scalar;
         if *x == 0 {
             *x = 0;
@@ -62,7 +60,7 @@ impl Codec {
         }
     }
 
-    pub fn ternary_decode(x: &mut Scalar) {
+    pub fn ternary_decode(&self, x: &mut Scalar) {
         const SIXTH: Scalar = (Scalar::MAX as f64 / 6.0) as Scalar;
         const THIRD: Scalar = SIXTH + SIXTH;
         const HALF: Scalar = Scalar::MAX / 2;
@@ -76,40 +74,28 @@ impl Codec {
     }
 
     /// Encode a polynomial.
-    pub fn poly_encode<C>(&self, xs: &mut Polynomial<C>)
-    where
-        C: AsMutSlice<Element = Scalar>,
-    {
-        for coeff in xs.coefficient_iter_mut() {
+    pub fn poly_encode(&self, xs: &mut Polynomial<&mut [Scalar]>) {
+        for coeff in xs.iter_mut() {
             self.encode(coeff);
         }
     }
 
-    pub fn poly_decode<C>(&self, xs: &mut Polynomial<C>)
-    where
-        C: AsMutSlice<Element = Scalar>,
-    {
-        for coeff in xs.coefficient_iter_mut() {
+    pub fn poly_decode(&self, xs: &mut Polynomial<&mut [Scalar]>) {
+        for coeff in xs.iter_mut() {
             self.decode(coeff);
         }
     }
 
     /// Encode a ternary polynomial.
-    pub fn poly_ternary_encode<C>(xs: &mut Polynomial<C>)
-    where
-        C: AsMutSlice<Element = Scalar>,
-    {
-        for coeff in xs.coefficient_iter_mut() {
-            Self::ternary_encode(coeff);
+    pub fn poly_ternary_encode(&self, xs: &mut Polynomial<&mut [Scalar]>) {
+        for coeff in xs.iter_mut() {
+            self.ternary_encode(coeff);
         }
     }
 
-    pub fn poly_ternary_decode<C>(xs: &mut Polynomial<C>)
-    where
-        C: AsMutSlice<Element = Scalar>,
-    {
-        for coeff in xs.coefficient_iter_mut() {
-            Self::ternary_decode(coeff);
+    pub fn poly_ternary_decode(&self, xs: &mut Polynomial<&mut [Scalar]>) {
+        for coeff in xs.iter_mut() {
+            self.ternary_decode(coeff);
         }
     }
 }

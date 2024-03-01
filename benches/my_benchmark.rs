@@ -1,257 +1,382 @@
-#![allow(deprecated)]
-
-use concrete_core::{
-    commons::crypto::encoding::{Plaintext, PlaintextList},
-    prelude::MonomialDegree,
-};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use dyn_stack::ReborrowMut;
 use panacea::{
-    context::{Context, FftBuffer},
+    context::Context,
     num_types::{One, Scalar, Zero},
     params::TFHEParameters,
-    rgsw::RGSWCiphertext,
     rlwe::{
-        expand, expand_fourier, gen_all_subs_ksk, gen_all_subs_ksk_fourier,
-        make_decomposed_rlwe_ct, FourierRLWECiphertext, RLWECiphertext, RLWEKeyswitchKey,
-        RLWESecretKey,
+        convert_standard_ggsw_to_fourier, expand, gen_all_subs_ksk, less_eq_than,
+        make_decomposed_rlwe_ct, neg_gsw_std, trace1, FourierRLWEKeyswitchKey,
+    },
+};
+use tfhe::core_crypto::{
+    entities::{FourierGgswCiphertext, GgswCiphertext, Plaintext, PlaintextList},
+    prelude::{
+        add_external_product_assign_mem_optimized,
+        add_external_product_assign_mem_optimized_requirement, cmux_assign_mem_optimized,
+        cmux_assign_mem_optimized_requirement,
+        convert_standard_ggsw_ciphertext_to_fourier_mem_optimized,
+        convert_standard_ggsw_ciphertext_to_fourier_mem_optimized_requirement,
+        decrypt_glwe_ciphertext, encrypt_constant_ggsw_ciphertext, encrypt_glwe_ciphertext,
+        ComputationBuffers, GlweSecretKey,
     },
 };
 
-pub fn trace1_fourier_benchmark(c: &mut Criterion) {
+pub fn trace1_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
     let orig_msg = ctx.gen_binary_pt();
 
     let mut encoded_msg = orig_msg;
     ctx.codec.poly_encode(&mut encoded_msg.as_mut_polynomial());
     // we need to divide the encoded message by n, because n is multiplied into the trace output
-    for coeff in encoded_msg.as_mut_polynomial().coefficient_iter_mut() {
+    for coeff in encoded_msg.as_mut_polynomial().iter_mut() {
         *coeff /= ctx.poly_size.0 as Scalar;
     }
 
-    let sk = RLWESecretKey::generate_binary(ctx.poly_size, &mut ctx.secret_generator);
-    let mut ct = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encrypt_rlwe(
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+    let mut ct = ctx.empty_glwe_ciphertext();
+    encrypt_glwe_ciphertext(
+        &sk,
         &mut ct,
         &encoded_msg,
         ctx.std,
         &mut ctx.encryption_generator,
     );
 
-    let all_ksk = gen_all_subs_ksk_fourier(&sk, &mut ctx);
-
-    let mut output = RLWECiphertext::allocate(ctx.poly_size);
+    let all_ksk = gen_all_subs_ksk(&sk, &mut ctx);
 
     c.bench_function("trace1 fourier", |b| {
         b.iter(|| {
-            ct.trace1_fourier(&mut output, &all_ksk);
+            trace1(&ct, &all_ksk, &ctx);
         });
     });
 }
 
 pub fn less_eq_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
 
-    let m = ctx.poly_size.0 / 2;
-    let mut ptxt = PlaintextList::allocate(Scalar::zero(), ctx.plaintext_count());
-    *ptxt
-        .as_mut_polynomial()
-        .get_mut_monomial(MonomialDegree(m))
-        .get_mut_coefficient() = Scalar::one();
+    let m: Scalar = (ctx.poly_size.0 / 2) as Scalar;
 
-    let mut ct = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encode_encrypt_rlwe(&mut ct, &ptxt, &mut ctx);
+    let mut ptxt = ctx.gen_unit_pt();
+
+    let mut ct = ctx.empty_glwe_ciphertext();
+
+    ctx.codec.poly_encode(&mut ptxt.as_mut_polynomial());
+    encrypt_glwe_ciphertext(&sk, &mut ct, &ptxt, ctx.std, &mut ctx.encryption_generator);
 
     c.bench_function("less_eq", |b| {
         b.iter(|| {
-            ct.less_eq_than(m + 1);
-        });
-    });
-}
-
-pub fn expand_fourier_benchmark(c: &mut Criterion) {
-    let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
-    let neg_sk_ct = sk.neg_gsw(&mut ctx);
-
-    let ksk_map = gen_all_subs_ksk_fourier(&sk, &mut ctx);
-
-    let test_pt = ctx.gen_binary_pt();
-    let mut test_ct = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encode_encrypt_rlwe(&mut test_ct, &test_pt, &mut ctx);
-
-    let cs_one = make_decomposed_rlwe_ct(&sk, Scalar::one(), &mut ctx);
-
-    c.bench_function("expand fourier", |b| {
-        b.iter(|| {
-            expand_fourier(&cs_one, &ksk_map, &neg_sk_ct, &ctx);
+            less_eq_than(&mut ct, m + 1);
         });
     });
 }
 
 pub fn expand_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
-    let neg_sk_ct = sk.neg_gsw(&mut ctx);
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+    let mut buf = ctx.gen_fft_ctx();
+    let neg_sk_ct = convert_standard_ggsw_to_fourier(neg_gsw_std(&sk, &mut ctx), &ctx, &mut buf);
+
     let ksk_map = gen_all_subs_ksk(&sk, &mut ctx);
 
     let test_pt = ctx.gen_binary_pt();
-    let mut test_ct = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encode_encrypt_rlwe(&mut test_ct, &test_pt, &mut ctx);
-
+    let mut test_ct = ctx.empty_glwe_ciphertext();
+    encrypt_glwe_ciphertext(
+        &sk,
+        &mut test_ct,
+        &test_pt,
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
     let cs_one = make_decomposed_rlwe_ct(&sk, Scalar::one(), &mut ctx);
-
-    c.bench_function("expand", |b| {
-        b.iter(|| {
-            expand(&cs_one, &ksk_map, &neg_sk_ct, &ctx);
-        });
-    });
-}
-
-pub fn keyswitch_gsw_benchmark(c: &mut Criterion) {
-    let mut ctx = Context::new(TFHEParameters::default());
-    let sk_after = ctx.gen_rlwe_sk();
-    let sk_before = ctx.gen_rlwe_sk();
-    let mut fft_buffer = FftBuffer::new(ctx.poly_size);
-
-    let mut ct_after = RLWECiphertext::allocate(ctx.poly_size);
-    let mut ct_before = RLWECiphertext::allocate(ctx.poly_size);
-
-    let mut ksk = RLWEKeyswitchKey::allocate(ctx.base_log, ctx.level_count, ctx.poly_size);
-    ksk.fill_with_keyswitch_key(
-        &sk_before,
-        &sk_after,
-        ctx.std,
-        &mut ctx.encryption_generator,
-    );
-    let fast_ksk = RGSWCiphertext::from_keyswitch_key(&ksk);
-
-    let messages = ctx.gen_ternary_ptxt();
-    sk_before.ternary_encrypt_rlwe(&mut ct_before, &messages, &mut ctx);
-
-    c.bench_function("keyswitch gsw", |b| {
-        b.iter(|| {
-            fast_ksk.keyswitch_ciphertext_with_buf(&mut ct_after, &ct_before, &mut fft_buffer);
-        });
-    });
-}
-
-pub fn keyswitch_fourier_benchmark(c: &mut Criterion) {
-    let mut ctx = Context::new(TFHEParameters::default());
-
-    let sk_after = ctx.gen_rlwe_sk();
-    let sk_before = ctx.gen_rlwe_sk();
-
-    let mut ct_after_fourier = FourierRLWECiphertext::new(ctx.poly_size.0);
-    let mut ct_before = RLWECiphertext::allocate(ctx.poly_size);
-
-    let mut ksk = RLWEKeyswitchKey::allocate(ctx.base_log, ctx.level_count, ctx.poly_size);
-    ksk.fill_with_keyswitch_key(
-        &sk_before,
-        &sk_after,
-        ctx.std,
-        &mut ctx.encryption_generator,
-    );
-    let ksk_fourier = ksk.into_fourier();
-
-    let messages = ctx.gen_ternary_ptxt();
-    sk_before.ternary_encrypt_rlwe(&mut ct_before, &messages, &mut ctx);
-
-    c.bench_function("keyswitch fourier", |b| {
-        b.iter(|| {
-            ksk_fourier.keyswitch_ciphertext(&mut ct_after_fourier, &ct_before);
-        });
+    c.bench_function("expand fourier", move |b| {
+        b.iter_batched(
+            || cs_one.clone(),
+            |ct| {
+                expand(&ct, &ksk_map, &neg_sk_ct, &ctx, &mut buf);
+            },
+            BatchSize::PerIteration,
+        );
     });
 }
 
 pub fn keyswitch_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk_after = ctx.gen_rlwe_sk();
-    let sk_before = ctx.gen_rlwe_sk();
 
-    let mut ct_after = RLWECiphertext::allocate(ctx.poly_size);
-    let mut ct_before = RLWECiphertext::allocate(ctx.poly_size);
+    let sk_after = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+    let sk_before = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
 
-    let mut ksk = RLWEKeyswitchKey::allocate(ctx.base_log, ctx.level_count, ctx.poly_size);
-    ksk.fill_with_keyswitch_key(
+    let mut ct_before = ctx.empty_glwe_ciphertext();
+
+    let ksk_fourier = FourierRLWEKeyswitchKey::new(sk_before.clone(), &sk_after, &mut ctx);
+
+    let messages = ctx.gen_ternary_ptxt();
+
+    encrypt_glwe_ciphertext(
         &sk_before,
-        &sk_after,
+        &mut ct_before,
+        &messages,
         ctx.std,
         &mut ctx.encryption_generator,
     );
 
-    let messages = ctx.gen_ternary_ptxt();
-    sk_before.ternary_encrypt_rlwe(&mut ct_before, &messages, &mut ctx);
+    c.bench_function("keyswitch fourier", |b| {
+        b.iter_batched(
+            || ct_before.clone(),
+            |ct_b| ksk_fourier.keyswitch_ciphertext(ct_b, &ctx),
+            BatchSize::PerIteration,
+        );
+    });
+}
 
-    c.bench_function("keyswitch", |b| {
-        b.iter(|| {
-            ksk.keyswitch_ciphertext(&mut ct_after, &ct_before);
-        });
+pub fn gen_ksk_benchmark(c: &mut Criterion) {
+    let mut ctx = Context::new(TFHEParameters::default());
+    let sk_after = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+    let sk_before = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+
+    c.bench_function("ksk_fill_fourier", |b| {
+        b.iter_batched(
+            || sk_before.clone(),
+            |sk_bef| FourierRLWEKeyswitchKey::new(sk_bef, &sk_after, &mut ctx),
+            BatchSize::PerIteration,
+        );
     });
 }
 
 pub fn cmux_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
-    let mut fft_buffer = FftBuffer::new(ctx.poly_size);
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
 
-    let mut gsw_ct = RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count);
-    sk.encrypt_constant_rgsw(&mut gsw_ct, &Plaintext(Scalar::one()), &mut ctx);
+    let mut gsw_ct = GgswCiphertext::new(
+        Scalar::zero(),
+        ctx.glwe_size,
+        ctx.poly_size,
+        ctx.base_log,
+        ctx.level_count,
+        ctx.ciphertext_modulus,
+    );
+    encrypt_constant_ggsw_ciphertext(
+        &sk,
+        &mut gsw_ct,
+        Plaintext(Scalar::one()),
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
 
-    let mut rlwe_ct_0 = RLWECiphertext::allocate(ctx.poly_size);
-    let mut rlwe_ct_1 = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encrypt_constant_rlwe(&mut rlwe_ct_0, &Plaintext(Scalar::zero()), &mut ctx);
-    sk.encrypt_constant_rlwe(&mut rlwe_ct_1, &Plaintext(Scalar::one()), &mut ctx);
+    let mut rlwe_ct_0 = ctx.empty_glwe_ciphertext();
+    let mut rlwe_ct_1 = ctx.empty_glwe_ciphertext();
 
-    let mut rlwe_ct_out = RLWECiphertext::allocate(ctx.poly_size);
+    let mut pt0 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+    (*pt0.as_mut_polynomial().as_mut())[0] = Scalar::zero();
+
+    encrypt_glwe_ciphertext(
+        &sk,
+        &mut rlwe_ct_0,
+        &pt0,
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
+    let mut pt1 = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+    (*pt1.as_mut_polynomial().as_mut())[0] = Scalar::one();
+
+    encrypt_glwe_ciphertext(
+        &sk,
+        &mut rlwe_ct_1,
+        &pt1,
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
+
+    let mut mem = ComputationBuffers::new();
+    mem.resize(
+        cmux_assign_mem_optimized_requirement::<Scalar>(
+            ctx.glwe_size,
+            ctx.poly_size,
+            ctx.fft.as_view(),
+        )
+        .unwrap()
+        .unaligned_bytes_required()
+        .max(
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized_requirement(
+                ctx.fft.as_view(),
+            )
+            .unwrap()
+            .unaligned_bytes_required(),
+        ),
+    );
+
+    let mut stack = mem.stack();
+
+    let mut fourier_ggsw =
+        FourierGgswCiphertext::new(ctx.glwe_size, ctx.poly_size, ctx.base_log, ctx.level_count);
+    convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+        &gsw_ct,
+        &mut fourier_ggsw,
+        ctx.fft.as_view(),
+        stack.rb_mut(),
+    );
+
     c.bench_function("cmux", |b| {
-        b.iter(|| gsw_ct.cmux_with_buf(&mut rlwe_ct_out, &rlwe_ct_0, &rlwe_ct_1, &mut fft_buffer));
+        b.iter(|| {
+            cmux_assign_mem_optimized(
+                &mut rlwe_ct_0,
+                &mut rlwe_ct_1,
+                &fourier_ggsw,
+                ctx.fft.as_view(),
+                stack.rb_mut(),
+            )
+        })
     });
 }
 
 pub fn external_product_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
-    let mut fft_buffer = FftBuffer::new(ctx.poly_size);
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
+    let mut mem = ComputationBuffers::new();
+    mem.resize(
+        add_external_product_assign_mem_optimized_requirement::<Scalar>(
+            ctx.glwe_size,
+            ctx.poly_size,
+            ctx.fft.as_view(),
+        )
+        .unwrap()
+        .unaligned_bytes_required()
+        .max(
+            convert_standard_ggsw_ciphertext_to_fourier_mem_optimized_requirement(
+                ctx.fft.as_view(),
+            )
+            .unwrap()
+            .unaligned_bytes_required(),
+        ),
+    );
 
-    let mut gsw_ct = RGSWCiphertext::allocate(ctx.poly_size, ctx.base_log, ctx.level_count);
-    sk.encrypt_constant_rgsw(&mut gsw_ct, &Plaintext(Scalar::one()), &mut ctx);
+    let mut stack = mem.stack();
 
-    let mut rlwe_ct_0 = RLWECiphertext::allocate(ctx.poly_size);
-    sk.encrypt_constant_rlwe(&mut rlwe_ct_0, &Plaintext(Scalar::zero()), &mut ctx);
+    let mut gsw_ct = GgswCiphertext::new(
+        Scalar::zero(),
+        ctx.glwe_size,
+        ctx.poly_size,
+        ctx.base_log,
+        ctx.level_count,
+        ctx.ciphertext_modulus,
+    );
+    encrypt_constant_ggsw_ciphertext(
+        &sk,
+        &mut gsw_ct,
+        Plaintext(Scalar::one()),
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
 
-    let mut rlwe_ct_out = RLWECiphertext::allocate(ctx.poly_size);
+    let mut fourier_ggsw =
+        FourierGgswCiphertext::new(ctx.glwe_size, ctx.poly_size, ctx.base_log, ctx.level_count);
+    convert_standard_ggsw_ciphertext_to_fourier_mem_optimized(
+        &gsw_ct,
+        &mut fourier_ggsw,
+        ctx.fft.as_view(),
+        stack.rb_mut(),
+    );
+
+    let mut rlwe_ct_0 = ctx.empty_glwe_ciphertext();
+
+    let mut out_pt = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
+    (*out_pt.as_mut_polynomial().as_mut())[0] = Scalar::zero();
+
+    encrypt_glwe_ciphertext(
+        &sk,
+        &mut rlwe_ct_0,
+        &out_pt,
+        ctx.std,
+        &mut ctx.encryption_generator,
+    );
+
+    let mut rlwe_ct_out = ctx.empty_glwe_ciphertext();
     c.bench_function("external_product", |b| {
-        b.iter(|| gsw_ct.external_product_with_buf(&mut rlwe_ct_out, &rlwe_ct_0, &mut fft_buffer));
+        b.iter(|| {
+            add_external_product_assign_mem_optimized(
+                &mut rlwe_ct_out,
+                &fourier_ggsw,
+                &rlwe_ct_0,
+                ctx.fft.as_view(),
+                stack.rb_mut(),
+            )
+        })
     });
 }
 
 pub fn enc_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
 
-    let mut ct = RLWECiphertext::allocate(ctx.poly_size);
+    let mut ct = ctx.empty_glwe_ciphertext();
     let pt = ctx.gen_binary_pt();
 
     c.bench_function("enc", |b| {
         b.iter(|| {
-            sk.encode_encrypt_rlwe(&mut ct, &pt, &mut ctx);
+            encrypt_glwe_ciphertext(&sk, &mut ct, &pt, ctx.std, &mut ctx.encryption_generator);
         });
     });
 }
 
 pub fn dec_benchmark(c: &mut Criterion) {
     let mut ctx = Context::new(TFHEParameters::default());
-    let sk = ctx.gen_rlwe_sk();
+    let sk = GlweSecretKey::generate_new_binary(
+        ctx.glwe_dimension,
+        ctx.poly_size,
+        &mut ctx.secret_generator,
+    );
 
-    let mut ct = RLWECiphertext::allocate(ctx.poly_size);
+    let mut ct = ctx.empty_glwe_ciphertext();
     let pt = ctx.gen_binary_pt();
-    sk.encode_encrypt_rlwe(&mut ct, &pt, &mut ctx);
 
-    let mut out_pt = PlaintextList::allocate(Scalar::zero(), ctx.plaintext_count());
+    encrypt_glwe_ciphertext(&sk, &mut ct, &pt, ctx.std, &mut ctx.encryption_generator);
+
+    let mut out_pt = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
     c.bench_function("dec", |b| {
         b.iter(|| {
-            sk.decrypt_decode_rlwe(&mut out_pt, &ct, &ctx);
+            decrypt_glwe_ciphertext(&sk, &ct, &mut out_pt);
+            ctx.codec.poly_decode(&mut out_pt.as_mut_polynomial());
         });
     });
 }
@@ -263,12 +388,10 @@ criterion_group!(
     external_product_benchmark,
     cmux_benchmark,
     keyswitch_benchmark,
-    keyswitch_fourier_benchmark,
-    keyswitch_gsw_benchmark,
     expand_benchmark,
-    expand_fourier_benchmark,
     less_eq_benchmark,
-    trace1_fourier_benchmark,
+    trace1_benchmark,
+    gen_ksk_benchmark,
     // oram_benchmark
 );
 criterion_main!(benches);
