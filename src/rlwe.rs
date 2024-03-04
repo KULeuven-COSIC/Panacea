@@ -106,7 +106,6 @@ pub fn less_eq_than(ct: &mut GlweCiphertext<AlignedScalarContainer>, d: Scalar) 
 
     assert!(d < n);
 
-    // Todo: Encoding Issue here
     let t_poly = {
         let mut t = vec![Scalar::zero(); n];
         t[0] = Scalar::one();
@@ -168,7 +167,8 @@ pub fn not_in_place(ct: &mut GlweCiphertext<AlignedScalarContainer>) {
     ct.get_mut_body().as_mut()[0] = ct.get_body().as_ref()[0].wrapping_add(delta);
 }
 
-/// Return NOT(ct) where self must encrypt a binary scalar.
+/// Return NOT(ct) where self must encrypt a binary scalar,
+/// i.e., the scaling factor \Delta must be q/2.
 pub fn not(ct: &GlweCiphertext<AlignedScalarContainer>) -> GlweCiphertext<AlignedScalarContainer> {
     let delta = Scalar::one() << (Scalar::BITS - 1);
     let mut out = GlweCiphertext::from_container(
@@ -375,7 +375,6 @@ impl FourierRLWEKeyswitchKey {
         fourier_ksk
     }
 
-    // }
     /// Perform key switching but don't convert the new ciphertext to the standard domain.
     pub fn keyswitch_ciphertext(
         &self,

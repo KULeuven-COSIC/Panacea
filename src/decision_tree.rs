@@ -567,12 +567,12 @@ fn demux_rec(
 /// Every feature v is encrypted as RLWE(1/(B^j n) X^v) for j in 1...\ell
 pub fn encrypt_feature_vector(
     sk: &GlweSecretKey<ScalarContainer>,
-    vs: &Vec<Scalar>,
+    vs: &[Scalar],
     ctx: &mut Context<Scalar>,
 ) -> Vec<Vec<GlweCiphertext<AlignedScalarContainer>>> {
     let mut pt = PlaintextList::new(Scalar::zero(), ctx.plaintext_count());
     let logn = log2(ctx.poly_size.0) as Scalar;
-    let mut out = Vec::new(); // TODO preallocate
+    let mut out = Vec::with_capacity(vs.len());
     for v in vs {
         let mut tmp = Vec::new();
         for level in 1..=ctx.level_count.0 as Scalar {
@@ -583,7 +583,7 @@ pub fn encrypt_feature_vector(
             (*pt.as_mut())[*v as usize] = Scalar::one() << shift;
 
             let mut ct = ctx.empty_glwe_ciphertext();
-            //todo consider assign or list
+            // TODO consider assign or list
             encrypt_glwe_ciphertext(sk, &mut ct, &pt, ctx.std, &mut ctx.encryption_generator);
 
             tmp.push(ct);
@@ -873,7 +873,7 @@ mod test {
         let features = vec![2, 3]; // f_0 = 2, f_1 = 3
         assert_eq!(10, root.eval(&features));
 
-        simulate(&root, &vec![features], false);
+        simulate(&root, &[features], false);
     }
 
     #[test]
@@ -920,7 +920,7 @@ mod test {
         let features = vec![2, 3]; // f_0 = 2, f_1 = 3
         assert_eq!(0, root.eval(&features));
 
-        simulate(&root, &vec![features], false);
+        simulate(&root, &[features], false);
     }
 
     #[test]
@@ -949,12 +949,12 @@ mod test {
         {
             let features = vec![1];
             assert_eq!(1, root.eval(&features));
-            simulate(&root, &vec![features], false);
+            simulate(&root, &[features], false);
         }
         {
             let features = vec![11];
             assert_eq!(0, root.eval(&features));
-            simulate(&root, &vec![features], false);
+            simulate(&root, &[features], false);
         }
     }
 
@@ -1183,7 +1183,7 @@ mod test {
 
             let mut pt = ctx.gen_zero_pt();
             for (j, ct) in cts.iter().enumerate().take(1 << depth) {
-                decrypt_glwe_ciphertext(&sk, &ct, &mut pt);
+                decrypt_glwe_ciphertext(&sk, ct, &mut pt);
                 ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
 
                 if j == i {

@@ -44,8 +44,8 @@ impl FftBufferPool {
 struct EncOP(GgswCiphertext<ScalarContainer>);
 
 enum OP {
-    READ,
-    WRITE,
+    Read,
+    Write,
 }
 
 /// The client's encrypted query.
@@ -174,8 +174,8 @@ impl Client {
             self.ctx.ciphertext_modulus,
         );
         let pt = match op {
-            OP::READ => Plaintext(Scalar::zero()),
-            OP::WRITE => Plaintext(Scalar::one()),
+            OP::Read => Plaintext(Scalar::zero()),
+            OP::Write => Plaintext(Scalar::one()),
         };
         par_encrypt_constant_ggsw_ciphertext(
             &self.sk,
@@ -213,7 +213,7 @@ impl Client {
 
         ClientQuery {
             a,
-            op: self.gen_enc_op(&OP::READ),
+            op: self.gen_enc_op(&OP::Read),
             data: self.enc_data_rlwe(dummy_data),
         }
     }
@@ -243,7 +243,7 @@ impl Client {
         let a = bit_decomposed_rgsw(i, self.cols, &self.sk, &mut self.ctx);
         ClientQuery {
             a,
-            op: self.gen_enc_op(&OP::WRITE),
+            op: self.gen_enc_op(&OP::Write),
             data: self.enc_data_rlwe(alpha),
         }
     }
@@ -320,7 +320,7 @@ fn process_one_mt(
             .map(|ct| {
                 convert_standard_ggsw_to_fourier(
                     ct.clone(),
-                    &ctx,
+                    ctx,
                     &mut buf.pool[tid].clone().lock().unwrap(),
                 )
             })
@@ -405,7 +405,7 @@ fn update_db_mt(
         cmux_assign_mem_optimized(
             &mut data.clone().write().unwrap()[j],
             &mut tmp,
-            &l,
+            l,
             ctx.fft.as_view(),
             buf.pool[tid].clone().lock().unwrap().mem.stack().rb_mut(),
         );
@@ -489,7 +489,7 @@ fn process_one_st(
 fn update_db_st(
     query: &ClientQuery,
     data: Arc<RwLock<Vec<GlweCiphertext<AlignedScalarContainer>>>>,
-    ls: &Vec<FourierGgswCiphertext<ComplexBox>>,
+    ls: &[FourierGgswCiphertext<ComplexBox>],
     buf: &FftBufferPool,
     ctx: &Context<Scalar>,
 ) {
@@ -734,7 +734,7 @@ impl Server {
                     .iter()
                     .map(|v| {
                         let mut pt = self.ctx.gen_zero_pt();
-                        decrypt_glwe_ciphertext(&sk, &v, &mut pt);
+                        decrypt_glwe_ciphertext(sk, v, &mut pt);
                         self.ctx.codec.poly_decode(&mut pt.as_mut_polynomial());
 
                         pt_to_lossy_u64(&pt)
@@ -915,7 +915,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_oram_more() {
         let n = 2048usize;
         let hash = NaiveHash::new(1, n);
@@ -1091,7 +1090,6 @@ mod test {
     }
 
     #[test]
-    #[ignore]
     fn test_oram_batch_more() {
         let h_count = 3usize;
         let rows = 3;

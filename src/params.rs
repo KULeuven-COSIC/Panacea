@@ -80,8 +80,6 @@ pub struct ServerParams {
     pub tfhe: TFHEParameters,
 }
 
-
-
 impl ServerParams {
     pub fn from_input_params_list(input: InputParamsList) -> Vec<Self> {
         let mut out: Vec<Self> = Vec::new();

@@ -392,6 +392,5 @@ criterion_group!(
     less_eq_benchmark,
     trace1_benchmark,
     gen_ksk_benchmark,
-    // oram_benchmark
 );
 criterion_main!(benches);
