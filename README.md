@@ -14,13 +14,11 @@ Please do not use in production systems.
 
 Our implementation is written in the Rust programming language.
 Please refer to [The Rust Programming Language Website](https://www.rust-lang.org/tools/install)
-to install the required tools (e.g., `rustup`, `cargo` and `rustc`).
-The main library we use is [concrete-core](https://github.com/zama-ai/concrete-core),
+to install the required tools, preferably using `rustup`.
+The main library we use is [tfhe-rs](https://github.com/zama-ai/tfhe-rs),
 but this is imported automatically with `cargo`.
 
-The stable toolchain can be used for Linux and Mac computers with Intel processors.
-
-Compiling for Windows is not supported at the moment.
+The stable toolchain can be used for Linux, macOS and Windows with Intel or ARM processors.
 
 ### To Compile
 ```
